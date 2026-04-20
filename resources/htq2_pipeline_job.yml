@@ -1,0 +1,191 @@
+resources:
+  jobs:
+    htq2_gtfs_pipeline:
+      name: "htq2_gtfs_pipeline_${bundle.target}"
+      description: |
+        HTQ2 GTFS Realtime pipeline for Skånetrafiken (v2.0).
+        8-task decomposed architecture: Ingest → Prep → Silver → Quality.
+        Processes GTFS data from Trafiklab.se into 22 analytical Delta tables.
+        Timestamp fix: ISO 8601 format parsing for observed duration columns.
+      max_concurrent_runs: 1
+      tags:
+        project: htq2
+        team: diggibyte
+        data_domain: transit
+        architecture_version: "2.0"
+
+      schedule:
+        quartz_cron_expression: "0 */10 * * * ?"
+        timezone_id: "Europe/Stockholm"
+        pause_status: PAUSED
+
+      # Single shared single-node cluster for all tasks
+      job_clusters:
+        - job_cluster_key: htq2_cluster
+          new_cluster:
+            spark_version: "17.3.x-scala2.13"
+            node_type_id: "Standard_DS4_v2"
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+              spark.sql.adaptive.enabled: "true"
+            custom_tags:
+              ResourceClass: SingleNode
+              project: htq2
+              team: diggibyte
+
+      tasks:
+        # ─── LAYER 1: INGESTION (parallel, no dependencies) ───
+        - task_key: ingest_realtime
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: ingest
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "bronze"
+              - "--volume"
+              - "${var.volume_path}"
+              - "--run_mode"
+              - "realtime"
+          libraries:
+            - whl: ./dist/*.whl
+            - pypi:
+                package: "gtfs-realtime-bindings>=1.0.0"
+            - pypi:
+                package: "requests>=2.31.0"
+            - pypi:
+                package: "protobuf>=4.25.0"
+          max_retries: 2
+          min_retry_interval_millis: 30000
+
+        - task_key: ingest_static
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: ingest
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "bronze"
+              - "--volume"
+              - "${var.volume_path}"
+              - "--run_mode"
+              - "static"
+          libraries:
+            - whl: ./dist/*.whl
+            - pypi:
+                package: "requests>=2.31.0"
+          max_retries: 2
+          min_retry_interval_millis: 30000
+
+        # ─── LAYER 2: PREP (depends on both ingestion tasks) ───
+        - task_key: parse_and_enrich
+          depends_on:
+            - task_key: ingest_realtime
+            - task_key: ingest_static
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: prep
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--bronze_schema"
+              - "bronze"
+              - "--silver_schema"
+              - "silver"
+              - "--volume"
+              - "${var.volume_path}"
+          libraries:
+            - whl: ./dist/*.whl
+            - pypi:
+                package: "gtfs-realtime-bindings>=1.0.0"
+            - pypi:
+                package: "requests>=2.31.0"
+            - pypi:
+                package: "protobuf>=4.25.0"
+
+        # ─── LAYER 3: SILVER (parallel, depend on prep) ───
+        - task_key: build_base_tables
+          depends_on:
+            - task_key: parse_and_enrich
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: transform
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--bronze_schema"
+              - "bronze"
+              - "--silver_schema"
+              - "silver"
+              - "--tables"
+              - "base"
+          libraries:
+            - whl: ./dist/*.whl
+
+        - task_key: build_gps_tables
+          depends_on:
+            - task_key: parse_and_enrich
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: transform
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--bronze_schema"
+              - "bronze"
+              - "--silver_schema"
+              - "silver"
+              - "--tables"
+              - "gps"
+          libraries:
+            - whl: ./dist/*.whl
+
+        - task_key: create_all_views
+          depends_on:
+            - task_key: build_base_tables
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: views
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "silver"
+          libraries:
+            - whl: ./dist/*.whl
+
+        # ─── LAYER 4: QUALITY (depends on all Layer 3 tasks) ───
+        - task_key: quality_gate
+          depends_on:
+            - task_key: build_base_tables
+            - task_key: build_gps_tables
+            - task_key: create_all_views
+          job_cluster_key: htq2_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: validate
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "silver"
+              - "--tables"
+              - "all"
+          libraries:
+            - whl: ./dist/*.whl
+
+      # Notifications
+      email_notifications:
+        on_failure:
+          - ops-team@diggibyte.com
+        no_alert_for_skipped_runs: true

@@ -1,0 +1,54 @@
+bundle:
+  name: htq2-gtfs-pipeline
+
+variables:
+  catalog:
+    description: "Unity Catalog catalog name for this environment"
+    default: htq2_dev
+  volume_path:
+    description: "Base path for the raw data volume"
+    default: trafiklab_raw
+
+artifacts:
+  htq2_gtfs_wheel:
+    type: whl
+    path: .
+    build: python -m build --wheel
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: ${workspace.host}
+    variables:
+      catalog: htq2_dev
+
+  staging:
+    workspace:
+      host: ${workspace.host}
+    variables:
+      catalog: htq2_staging
+    resources:
+      jobs:
+        htq2_gtfs_pipeline:
+          schedule:
+            quartz_cron_expression: "0 0 * * * ?"
+            timezone_id: "Europe/Stockholm"
+            pause_status: UNPAUSED
+
+  prod:
+    workspace:
+      host: ${workspace.host}
+    variables:
+      catalog: htq2_prod
+    resources:
+      jobs:
+        htq2_gtfs_pipeline:
+          schedule:
+            quartz_cron_expression: "0 */10 * * * ?"
+            timezone_id: "Europe/Stockholm"
+            pause_status: UNPAUSED

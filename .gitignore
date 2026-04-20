@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Databricks
+.databricks/
+
+# Env
+.env
+*.log

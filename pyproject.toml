@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "htq2_gtfs"
+version = "2.0.0"
+description = "HTQ2 GTFS Realtime pipeline for Skånetrafiken — 8-task decomposed architecture"
+requires-python = ">=3.10"
+authors = [
+    {name = "DiggiByte Solutions", email = "dev@diggibyte.com"}
+]
+readme = "README.md"
+license = {text = "Proprietary"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "protobuf>=4.25.0",
+    "gtfs-realtime-bindings>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+# Entry points for Databricks python_wheel_task (5 total)
+[project.entry-points."htq2_gtfs"]
+ingest    = "htq2_gtfs.ingestion.main:main"
+prep      = "htq2_gtfs.prep.main:main"
+transform = "htq2_gtfs.processing.main:main"
+views     = "htq2_gtfs.views.main:main"
+validate  = "htq2_gtfs.quality.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
