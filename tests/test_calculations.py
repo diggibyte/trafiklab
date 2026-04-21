@@ -2,7 +2,7 @@
 
 import pytest
 from pyspark.sql import functions as F
-
+from pyspark.sql.types import StructType, StructField, DoubleType
 from htq2_gtfs.helpers.spark_helpers import (
     delay_minutes_col,
     haversine_col,
@@ -38,7 +38,8 @@ class TestPunctuality:
         assert result == "Late"
 
     def test_null_delay(self, spark):
-        df = spark.createDataFrame([(None,)], ["delay"])
+        schema = StructType([StructField("delay", DoubleType(), True)])
+        df = spark.createDataFrame([(None,)], schema) 
         result = df.select(punctuality_col("delay").alias("p")).collect()[0]["p"]
         assert result is None
 
