@@ -37,7 +37,7 @@ resources:
               - "--run_mode"
               - "realtime"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
             - pypi:
                 package: "gtfs-realtime-bindings>=1.0.0"
             - pypi:
@@ -62,7 +62,7 @@ resources:
               - "--run_mode"
               - "static"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
             - pypi:
                 package: "requests>=2.31.0"
           max_retries: 2
@@ -87,7 +87,7 @@ resources:
               - "--volume"
               - "${var.volume_path}"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
             - pypi:
                 package: "gtfs-realtime-bindings>=1.0.0"
             - pypi:
@@ -113,7 +113,7 @@ resources:
               - "--tables"
               - "base"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
 
         - task_key: build_gps_tables
           depends_on:
@@ -132,7 +132,7 @@ resources:
               - "--tables"
               - "gps"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
 
         - task_key: create_all_views
           depends_on:
@@ -147,7 +147,7 @@ resources:
               - "--schema"
               - "silver"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
 
         # ─── LAYER 4: QUALITY (depends on all Layer 3 tasks) ───
         - task_key: quality_gate
@@ -167,5 +167,5 @@ resources:
               - "--tables"
               - "all"
           libraries:
-            - whl: ./dist/*.whl
+            - whl: ../dist/*.whl
 
