@@ -12,13 +12,16 @@ resources:
       job_clusters:
         - job_cluster_key: htq2_cluster
           new_cluster:
+            data_security_mode: DATA_SECURITY_MODE_AUTO
+            kind: CLASSIC_PREVIEW
             spark_version: "17.3.x-scala2.13"
             node_type_id: "Standard_DS4_v2"
             num_workers: 0
             spark_conf:
-              spark.databricks.cluster.profile: singleNode
               spark.master: "local[*]"
               spark.sql.adaptive.enabled: "true"
+            enable_elastic_disk: true
+            is_single_node: true
 
       tasks:
         # ─── LAYER 1: INGESTION (parallel, no dependencies) ───
@@ -168,4 +171,3 @@ resources:
               - "all"
           libraries:
             - whl: ../dist/*.whl
-
