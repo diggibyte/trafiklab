@@ -2,18 +2,7 @@ resources:
   jobs:
     htq2_gtfs_pipeline:
       name: "htq2_gtfs_pipeline_${bundle.target}"
-      description: |
-        HTQ2 GTFS Realtime pipeline for Skånetrafiken (v2.0).
-        8-task decomposed architecture: Ingest → Prep → Silver → Quality.
-        Processes GTFS data from Trafiklab.se into 22 analytical Delta tables.
-        Timestamp fix: ISO 8601 format parsing for observed duration columns.
       max_concurrent_runs: 1
-      tags:
-        project: htq2
-        team: diggibyte
-        data_domain: transit
-        architecture_version: "2.0"
-
       schedule:
         quartz_cron_expression: "0 */10 * * * ?"
         timezone_id: "Europe/Stockholm"
@@ -30,10 +19,6 @@ resources:
               spark.databricks.cluster.profile: singleNode
               spark.master: "local[*]"
               spark.sql.adaptive.enabled: "true"
-            custom_tags:
-              ResourceClass: SingleNode
-              project: htq2
-              team: diggibyte
 
       tasks:
         # ─── LAYER 1: INGESTION (parallel, no dependencies) ───
@@ -184,8 +169,3 @@ resources:
           libraries:
             - whl: ./dist/*.whl
 
-      # Notifications
-      email_notifications:
-        on_failure:
-          - ops-team@diggibyte.com
-        no_alert_for_skipped_runs: true
