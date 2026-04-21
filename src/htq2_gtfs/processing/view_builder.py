@@ -9,6 +9,7 @@ Architecture:
 - 6 independent tables: JourneyLink and StopPoint analyses
 """
 
+
 from __future__ import annotations
 
 from pyspark.sql import DataFrame, SparkSession
@@ -38,12 +39,19 @@ class ViewBuilder:
 
     Usage:
         builder = ViewBuilder(spark)
-        tables = builder.build_all(journey_df, journey_call_df, vp_df, stops_df)
+        tables = builder.build_all(
+            journey_df, journey_call_df, vp_df, stops_df,
+            shapes_df, trips_df, stop_times_df,
+        )
         # tables is a dict of table_name -> DataFrame
     """
 
     def __init__(self, spark: SparkSession) -> None:
         self.spark = spark
+
+    # ================================================================
+    # TOP-LEVEL ORCHESTRATORS (FIXED)
+    # ================================================================
 
     def build_all(
         self,
@@ -51,23 +59,28 @@ class ViewBuilder:
         journey_call_df: DataFrame,
         vp_df: DataFrame = None,
         stops_df: DataFrame = None,
+        shapes_df: DataFrame = None,        
+        trips_df: DataFrame = None,         
+        stop_times_df: DataFrame = None,    
     ) -> dict[str, DataFrame]:
         """Build all 22 tables. Returns dict of table_name -> DataFrame.
 
         Args:
             journey_df: Base journey DataFrame.
             journey_call_df: Base journey call DataFrame.
-            vp_df: VehiclePositions GPS DataFrame (Phase 2).
-            stops_df: Static stops DataFrame with coordinates (Phase 2).
+            vp_df: VehiclePositions GPS DataFrame.
+            stops_df: Static stops DataFrame with coordinates.
+            shapes_df: Static shapes.txt DataFrame.            # FIX
+            trips_df: Static trips.txt DataFrame.              # FIX
+            stop_times_df: Static stop_times.txt DataFrame.    # FIX
         """
         tables: dict[str, DataFrame] = {}
 
-        # Cache base DataFrames (read by multiple builders)
         journey_df.cache()
         journey_call_df.cache()
 
         try:
-            # Base tables (pass through with dedup)
+            # Base tables
             tables["journey"] = self._build_journey(journey_df)
             tables["journey_call"] = self._build_journey_call(journey_call_df)
 
@@ -85,9 +98,15 @@ class ViewBuilder:
             tables["journey_start_delay"] = self._build_journey_start_delay(journey_call_df)
             tables["journey_block_first_start_delay"] = self._build_block_first_start_delay(journey_call_df, journey_df)
             tables["journey_missing"] = self._build_journey_missing(journey_df)
+
+            # FIX: pass vp_df to observed path builders
             tables["journey_observed_path"] = self._build_observed_path(journey_df, vp_df)
             tables["journey_observed_path_extended"] = self._build_observed_path_extended(journey_df, vp_df)
-            tables["journey_planned_path"] = self._build_planned_path(journey_df)
+
+            # FIX: pass shapes_df, trips_df, stop_times_df to planned path
+            tables["journey_planned_path"] = self._build_planned_path(
+                journey_df, shapes_df, trips_df, stop_times_df
+            )
 
             # Independent tables — Phase 2 GPS analysis
             tables["journey_link_observed_path"] = self._build_link_observed_path(journey_call_df, vp_df)
@@ -107,12 +126,14 @@ class ViewBuilder:
         )
         return tables
 
-
     def build_base_tables(
         self,
         journey_df: DataFrame,
         journey_call_df: DataFrame,
-    ) -> dict[str, DataFrame]:
+        vp_df: DataFrame = None,            
+        shapes_df: DataFrame = None,        
+        trips_df: DataFrame = None,         
+        stop_times_df: DataFrame = None,    
         """Build base + extension tables (16 total).
 
         Used when --tables=base. Reads from staging tables.
@@ -141,9 +162,15 @@ class ViewBuilder:
             tables["journey_start_delay"] = self._build_journey_start_delay(journey_call_df)
             tables["journey_block_first_start_delay"] = self._build_block_first_start_delay(journey_call_df, journey_df)
             tables["journey_missing"] = self._build_journey_missing(journey_df)
-            tables["journey_observed_path"] = self._build_observed_path(journey_df)
-            tables["journey_observed_path_extended"] = self._build_observed_path_extended(journey_df)
-            tables["journey_planned_path"] = self._build_planned_path(journey_df)
+
+            # FIX: pass vp_df (was missing before)
+            tables["journey_observed_path"] = self._build_observed_path(journey_df, vp_df)
+            tables["journey_observed_path_extended"] = self._build_observed_path_extended(journey_df, vp_df)
+
+            # FIX: pass shapes_df, trips_df, stop_times_df (were missing before)
+            tables["journey_planned_path"] = self._build_planned_path(
+                journey_df, shapes_df, trips_df, stop_times_df
+            )
 
         finally:
             journey_df.unpersist()
@@ -182,7 +209,6 @@ class ViewBuilder:
         """Build journey table from raw parsed data."""
         result = df.drop("_source_timestamp", "_is_cancelled")
 
-        # ── Hardcoded columns for Skånetrafiken ──────────────────────────
         result = (
             result
             .withColumn("TransportAuthorityNumber", F.lit(12))
@@ -213,7 +239,6 @@ class ViewBuilder:
         """
         result = df.drop("_source_timestamp")
 
-        # ── Hardcoded columns for Skånetrafiken ──────────────────────────
         result = (
             result
             .withColumn("StopTransportAuthorityNumber", F.lit(12))
@@ -231,12 +256,9 @@ class ViewBuilder:
             )
         )
 
-        # ── Stop distances (Synapse: _calculate_stop_distances) ──────────
-        # Haversine between consecutive stops within the same journey.
-        R = 6371000.0  # Earth radius in meters
+        R = 6371000.0
         w = Window.partitionBy("DVJId").orderBy(F.col("SequenceNumber").cast("int"))
 
-        # Get prev/next stop coordinates via Window lag/lead
         result = (
             result
             .withColumn("_prev_lat", F.lag("Coord_Latitude").over(w))
@@ -246,7 +268,6 @@ class ViewBuilder:
         )
 
         def _haversine(lat1, lon1, lat2, lon2):
-            """Haversine column expression returning distance in meters."""
             dlat = F.radians(lat2 - lat1)
             dlon = F.radians(lon2 - lon1)
             a = (
@@ -282,7 +303,6 @@ class ViewBuilder:
 
     def _build_call_apc(self, df: DataFrame) -> DataFrame:
         """APC extension: passenger counting data."""
-        # APC data comes from VehiclePositions; stub with nulls if not present
         return df.select(
             "DVJId", "SequenceNumber",
             F.col("OnboardCount").cast(T.IntegerType()) if "OnboardCount" in df.columns else F.lit(None).cast("string").alias("OnboardCount"),
@@ -346,11 +366,10 @@ class ViewBuilder:
         - Cumulative (accumulated) sums per journey
         - Average speed between stops (haversine distance / run time)
         """
-        R = 6371000.0  # Earth radius in meters
+        R = 6371000.0
         w = Window.partitionBy("DVJId").orderBy(F.col("SequenceNumber").cast("int"))
         w_cum = w.rowsBetween(Window.unboundedPreceding, Window.currentRow)
 
-        # Select needed columns + dedup
         cols_needed = ["DVJId", "SequenceNumber",
                        "ObservedArrivalDateTime", "ObservedDepartureDateTime",
                        "TimetabledLatestArrivalDateTime", "TimetabledEarliestDepartureDateTime",
@@ -359,7 +378,6 @@ class ViewBuilder:
         select_cols = [c for c in cols_needed if c in df.columns]
         result = df.select(*select_cols).dropDuplicates(["DVJId", "SequenceNumber"])
 
-        # Cast datetime strings to unix seconds for arithmetic
         result = (
             result
             .withColumn("_obs_arr_ts", F.unix_timestamp(F.col("ObservedArrivalDateTime"), "yyyy-MM-dd'T'HH:mm:ssXXX"))
@@ -368,7 +386,7 @@ class ViewBuilder:
             .withColumn("_tt_dep_ts", F.unix_timestamp(F.col("TimetabledEarliestDepartureDateTime")))
         )
 
-        # ── 1. Stop durations (time spent at current stop) ──
+        # 1. Stop durations
         result = result.withColumn(
             "ObservedStopDurationSeconds",
             (F.col("_obs_dep_ts") - F.col("_obs_arr_ts")).cast(T.LongType()),
@@ -378,7 +396,7 @@ class ViewBuilder:
             (F.col("_tt_dep_ts") - F.col("_tt_arr_ts")).cast(T.LongType()),
         )
 
-        # ── 2. Run durations (time between prev departure and current arrival) ──
+        # 2. Run durations
         result = result.withColumn("_prev_obs_dep_ts", F.lag("_obs_dep_ts").over(w))
         result = result.withColumn("_prev_tt_dep_ts", F.lag("_tt_dep_ts").over(w))
 
@@ -391,14 +409,14 @@ class ViewBuilder:
             (F.col("_tt_arr_ts") - F.col("_prev_tt_dep_ts")).cast(T.LongType()),
         )
 
-        # ── 3. Difference between observed and planned run duration ──
+        # 3. Diff
         result = result.withColumn(
             "DiffRunDurationSeconds",
             (F.col("ObservedRunDurationFromPrevStopSeconds")
              - F.col("PlannedRunDurationFromPrevStopSeconds")).cast(T.LongType()),
         )
 
-        # ── 4. Duration since first departure in the journey ──
+        # 4. Duration since first departure
         result = result.withColumn(
             "_first_dep_ts",
             F.first("_obs_dep_ts", ignorenulls=True).over(
@@ -411,7 +429,7 @@ class ViewBuilder:
             (F.col("_obs_dep_ts") - F.col("_first_dep_ts")).cast(T.LongType()),
         )
 
-        # ── 5. Accumulated (cumulative) sums per journey ──
+        # 5. Accumulated sums
         result = result.withColumn(
             "AccObservedStopDurationSeconds",
             F.sum("ObservedStopDurationSeconds").over(w_cum).cast(T.LongType()),
@@ -433,7 +451,7 @@ class ViewBuilder:
             F.sum("DiffRunDurationSeconds").over(w_cum).cast(T.LongType()),
         )
 
-        # ── 6. Average speed between stops (haversine / run duration) ──
+        # 6. Average speed
         result = result.withColumn("_prev_lat", F.lag("Coord_Latitude").over(w))
         result = result.withColumn("_prev_lon", F.lag("Coord_Longitude").over(w))
 
@@ -457,26 +475,20 @@ class ViewBuilder:
             ).cast(T.DoubleType()),
         )
 
-        # ── 7. Detection completeness (from arrival + departure state) ──
-        result = result.withColumn(
-            "DetectionCompletenessState",
-            F.lit("1").cast(T.StringType()),
-        )
-        result = result.withColumn(
-            "DetectionCompleteness",
-            F.lit("Complete").cast(T.StringType()),
-        )
+        # 7. Detection completeness
+        result = result.withColumn("DetectionCompletenessState", F.lit("1").cast(T.StringType()))
+        result = result.withColumn("DetectionCompleteness", F.lit("Complete").cast(T.StringType()))
 
-        # ── 8. Halts (from VP data — not available here, stays NULL) ──
+        # 8. Halts
         result = result.withColumn("HaltsOnLinkDurationSeconds", F.lit(None).cast(T.LongType()))
         result = result.withColumn("AccHaltsOnLinkDurationSeconds", F.lit(None).cast(T.LongType()))
 
-        # ── 9. APC counts (no hardware — stays NULL) ──
+        # 9. APC
         result = result.withColumn("OnboardCount", F.lit(None).cast(T.IntegerType()))
         result = result.withColumn("AlightingCount", F.lit(None).cast(T.IntegerType()))
         result = result.withColumn("BoardingCount", F.lit(None).cast(T.IntegerType()))
 
-        # ── 10. Delay pass-through ──
+        # 10. Delay pass-through
         if "ArrivalDelaySeconds" in df.columns:
             result = result.withColumn("ArrivalDelaySeconds", F.col("ArrivalDelaySeconds"))
         else:
@@ -486,7 +498,6 @@ class ViewBuilder:
         else:
             result = result.withColumn("DepartureDelaySeconds", F.lit(None).cast(T.LongType()))
 
-        # Drop internal temp columns
         result = result.drop(
             "_obs_arr_ts", "_obs_dep_ts", "_tt_arr_ts", "_tt_dep_ts",
             "_prev_obs_dep_ts", "_prev_tt_dep_ts", "_first_dep_ts",
@@ -545,7 +556,6 @@ class ViewBuilder:
 
     def _build_block_first_start_delay(self, call_df: DataFrame, journey_df: DataFrame) -> DataFrame:
         """Block first start delay: delay of the first journey in each block."""
-        # Simplified: same as start delay for now
         return self._build_journey_start_delay(call_df)
 
     def _build_journey_missing(self, journey_df: DataFrame) -> DataFrame:
@@ -558,24 +568,52 @@ class ViewBuilder:
             else F.lit(None).cast(T.StringType()).alias("ReasonTypeName"),
         ).dropDuplicates(["DVJId", "OperatingDate"])
 
+    # ================================================================
+    # FIXED: OBSERVED PATH — VP trip matching when DVJId missing
+    # ================================================================
+
     def _build_observed_path(self, journey_df: DataFrame, vp_df: DataFrame = None) -> DataFrame:
         """Observed path — GPS breadcrumb trail per journey.
-        
-        Ported from Synapse _build_journey_observed_path_view().
-        Extracts GPS position records from VehiclePositions per DVJId.
+
+        FIX: Adds trip matching when VP data lacks pre-joined DVJId.
+        Mirrors old code: tries TripId -> JourneyGid -> ReinforcedDVJId.
         """
         from htq2_gtfs.processing.models import JOURNEY_OBSERVED_PATH_EXT
-        
-        # If no VP data, return stub (one row per journey, all nulls)
+
+        # If no VP data, return stub
         if vp_df is None or vp_df.limit(1).count() == 0:
             result = journey_df.select("DVJId", "OperatingDate")
             for col_name in JOURNEY_OBSERVED_PATH_EXT:
                 result = result.withColumn(col_name, F.lit(None).cast(T.StringType()))
             return result.dropDuplicates(["DVJId", "OperatingDate"])
-        
-        # Extract GPS positions from VP data (one row per GPS point per journey)
+
+        # --- FIX: If VP data doesn't have DVJId, join via trip_id ---
+        if "DVJId" not in vp_df.columns:
+            # Build coalesce of all candidate trip-id columns from journey
+            trip_id_candidates = []
+            for col_name in ["TripId", "JourneyGid", "ReinforcedDVJId"]:
+                if col_name in journey_df.columns:
+                    trip_id_candidates.append(F.col(col_name))
+                else:
+                    trip_id_candidates.append(F.lit(None))
+
+            dvj_trip = journey_df.select(
+                "DVJId", "OperatingDate",
+                F.coalesce(*trip_id_candidates).cast("string").alias("_match_trip_id")
+            ).filter(F.col("_match_trip_id").isNotNull())
+
+            vp_df = (
+                vp_df
+                .withColumn("_match_trip_id", F.col("trip_id").cast("string"))
+                .join(dvj_trip, "_match_trip_id", "inner")
+                .drop("_match_trip_id")
+            )
+        elif "OperatingDate" not in vp_df.columns:
+            dvj_date = journey_df.select("DVJId", "OperatingDate").dropDuplicates(["DVJId"])
+            vp_df = vp_df.join(dvj_date, "DVJId", "left")
+
         w_vp = Window.partitionBy("DVJId").orderBy("timestamp")
-        
+
         observed = (
             vp_df
             .filter(F.col("DVJId").isNotNull() & F.col("latitude").isNotNull())
@@ -584,7 +622,8 @@ class ViewBuilder:
             .withColumn("Latitude", F.col("latitude").cast("string"))
             .withColumn("Longitude", F.col("longitude").cast("string"))
             .withColumn("SpeedKph",
-                F.when(F.col("speed").isNotNull(), (F.col("speed") * 3.6).cast("string")))
+                F.when(F.col("speed").isNotNull(),
+                       (F.col("speed") * 3.6).cast("string")))
             .withColumn("DirectionDegree",
                 F.when(F.col("bearing").isNotNull(), F.col("bearing").cast("string"))
                  .otherwise(F.lit(None).cast("string")))
@@ -595,13 +634,17 @@ class ViewBuilder:
             .withColumn("Note", F.lit(None).cast("string"))
             .select("DVJId", "OperatingDate", *JOURNEY_OBSERVED_PATH_EXT)
         )
-        
+
         return observed
+
+    # ================================================================
+    # FIXED: OBSERVED PATH EXTENDED — same VP trip matching
+    # ================================================================
 
     def _build_observed_path_extended(self, journey_df: DataFrame, vp_df: DataFrame = None) -> DataFrame:
         """Extended observed path with cumulative position offset.
-        
-        Ported from Synapse: cumulative haversine distance from journey start.
+
+        FIX: Adds trip matching when VP data lacks pre-joined DVJId.
         """
         # If no VP data, return stub
         if vp_df is None or vp_df.limit(1).count() == 0:
@@ -609,10 +652,33 @@ class ViewBuilder:
                 "DVJId", "OperatingDate",
                 F.lit(None).cast(T.DoubleType()).alias("RelativePositionOffsetMeters"),
             ).dropDuplicates(["DVJId", "OperatingDate"])
-        
+
+        # --- FIX: If VP data doesn't have DVJId, join via trip_id ---
+        if "DVJId" not in vp_df.columns:
+            trip_id_candidates = []
+            for col_name in ["TripId", "JourneyGid", "ReinforcedDVJId"]:
+                if col_name in journey_df.columns:
+                    trip_id_candidates.append(F.col(col_name))
+                else:
+                    trip_id_candidates.append(F.lit(None))
+
+            dvj_trip = journey_df.select(
+                "DVJId", "OperatingDate",
+                F.coalesce(*trip_id_candidates).cast("string").alias("_match_trip_id")
+            ).filter(F.col("_match_trip_id").isNotNull())
+
+            vp_df = (
+                vp_df
+                .withColumn("_match_trip_id", F.col("trip_id").cast("string"))
+                .join(dvj_trip, "_match_trip_id", "inner")
+                .drop("_match_trip_id")
+            )
+        elif "OperatingDate" not in vp_df.columns:
+            dvj_date = journey_df.select("DVJId", "OperatingDate").dropDuplicates(["DVJId"])
+            vp_df = vp_df.join(dvj_date, "DVJId", "left")
+
         w_vp = Window.partitionBy("DVJId").orderBy("timestamp")
-        
-        # Compute cumulative haversine distance
+
         extended = (
             vp_df
             .filter(F.col("DVJId").isNotNull() & F.col("latitude").isNotNull())
@@ -628,103 +694,200 @@ class ViewBuilder:
             )
             .withColumn("RelativePositionOffsetMeters",
                 F.sum("_segment_dist").over(
-                    Window.partitionBy("DVJId").orderBy("timestamp")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+                    w_vp.rowsBetween(Window.unboundedPreceding, Window.currentRow)
                 )
             )
             .select("DVJId", "OperatingDate", "RelativePositionOffsetMeters")
         )
-        
+
         return extended
 
-    def _build_planned_path(self, journey_df: DataFrame, shapes_df: DataFrame = None, trips_df: DataFrame = None) -> DataFrame:
+    # ================================================================
+    # FIXED: PLANNED PATH — shapes/trips params + EndOfLinkSeq + haversine fallback
+    # ================================================================
+
+    def _build_planned_path(
+        self,
+        journey_df: DataFrame,
+        shapes_df: DataFrame = None,
+        trips_df: DataFrame = None,
+        stop_times_df: DataFrame = None,    
+    ) -> DataFrame:
         """Planned path — route geometry from shapes.txt per journey.
-        
-        Ported from Synapse _build_journey_planned_path_view().
-        Maps shape points to journeys via trip_id → shape_id.
-        Computes EndOfLinkSequenceNumber, cumulative OnLinkOffsetMeters, and Next* coordinates.
+
+        FIX 1: Accepts shapes_df, trips_df, stop_times_df (were never passed before).
+        FIX 2: EndOfLinkSequenceNumber computed from stop_times (was hardcoded NULL).
+        FIX 3: OnLinkOffsetMeters has haversine fallback when shape_dist_traveled is NULL.
         """
         from htq2_gtfs.processing.models import JOURNEY_PLANNED_PATH_EXT
-        
-        # If no shapes data, return stub (one row per journey, all nulls)
+
+        # Stub when no data
         if shapes_df is None or shapes_df.limit(1).count() == 0:
             result = journey_df.select("DVJId", "OperatingDate")
             for col_name in JOURNEY_PLANNED_PATH_EXT:
                 result = result.withColumn(col_name, F.lit(None).cast(T.StringType()))
             return result.dropDuplicates(["DVJId", "OperatingDate"])
-        
+
         if trips_df is None or trips_df.limit(1).count() == 0:
             result = journey_df.select("DVJId", "OperatingDate")
             for col_name in JOURNEY_PLANNED_PATH_EXT:
                 result = result.withColumn(col_name, F.lit(None).cast(T.StringType()))
             return result.dropDuplicates(["DVJId", "OperatingDate"])
-        
-        # 1. Get trip_id → shape_id mapping
+
+        # 1. trip_id -> shape_id mapping
         trip_shape = trips_df.select(
             F.col("trip_id").cast("string"),
             F.col("shape_id").cast("string"),
         ).dropDuplicates(["trip_id"])
-        
-        # 2. Get DVJId → trip_id (JourneyGid) from journey data
+
+        # 2. DVJId -> trip_id from journey (tries TripId, then JourneyGid)
+        trip_id_candidates = []
+        for col_name in ["TripId", "JourneyGid"]:
+            if col_name in journey_df.columns:
+                trip_id_candidates.append(F.col(col_name))
+            else:
+                trip_id_candidates.append(F.lit(None))
+
         dvj_trip = journey_df.select(
             "DVJId", "OperatingDate",
-            F.col("JourneyGid").cast("string").alias("trip_id"),
+            F.coalesce(*trip_id_candidates).cast("string").alias("trip_id"),
         ).filter(F.col("trip_id").isNotNull())
-        
-        # 3. Join to get DVJId → shape_id
-        dvj_shape = dvj_trip.join(trip_shape, "trip_id", "inner").select("DVJId", "OperatingDate", "shape_id")
-        
-        # 4. Join with shapes data
-        w_shape = Window.partitionBy("shape_id").orderBy("shape_pt_sequence")
-        
+
+        # 3. DVJId -> shape_id
+        dvj_shape = (
+            dvj_trip
+            .join(trip_shape, "trip_id", "inner")
+            .select("DVJId", "OperatingDate", "shape_id", "trip_id")
+        )
+
+        # 4. Explode shape points per journey
+        w_dvj_shape = Window.partitionBy("DVJId").orderBy(
+            F.col("shape_pt_sequence").cast("int")
+        )
+
         path_points = (
             dvj_shape
             .join(shapes_df, "shape_id", "inner")
             .withColumn("Latitude", F.col("shape_pt_lat").cast("string"))
             .withColumn("Longitude", F.col("shape_pt_lon").cast("string"))
-            .withColumn("NextLatitude", F.lead("shape_pt_lat").over(
-                Window.partitionBy("DVJId").orderBy("shape_pt_sequence")
-            ).cast("string"))
-            .withColumn("NextLongitude", F.lead("shape_pt_lon").over(
-                Window.partitionBy("DVJId").orderBy("shape_pt_sequence")
-            ).cast("string"))
-            .withColumn("OnLinkOffsetMeters", F.col("shape_dist_traveled").cast("string"))
-            .withColumn("EndOfLinkSequenceNumber", F.lit(None).cast("string"))
-            .withColumn("SpeedLimitKmPerHour", F.lit(None).cast("string"))
-            .select("DVJId", "OperatingDate", *JOURNEY_PLANNED_PATH_EXT)
+            .withColumn("NextLatitude",
+                F.lead("shape_pt_lat").over(w_dvj_shape).cast("string"))
+            .withColumn("NextLongitude",
+                F.lead("shape_pt_lon").over(w_dvj_shape).cast("string"))
         )
-        
-        return path_points
 
+        # ---- FIX: OnLinkOffsetMeters with cumulative haversine fallback ----
+        R = 6371000.0
+        prev_lat = F.lag(F.col("shape_pt_lat").cast("double")).over(w_dvj_shape)
+        prev_lon = F.lag(F.col("shape_pt_lon").cast("double")).over(w_dvj_shape)
+        cur_lat  = F.col("shape_pt_lat").cast("double")
+        cur_lon  = F.col("shape_pt_lon").cast("double")
+
+        dlat = F.radians(cur_lat - prev_lat)
+        dlon = F.radians(cur_lon - prev_lon)
+        a = (
+            F.pow(F.sin(dlat / 2), 2)
+            + F.cos(F.radians(prev_lat)) * F.cos(F.radians(cur_lat))
+            * F.pow(F.sin(dlon / 2), 2)
+        )
+        segment_dist = F.when(
+            prev_lat.isNotNull(),
+            F.lit(2 * R) * F.asin(F.sqrt(a))
+        ).otherwise(F.lit(0.0))
+
+        cumulative_haversine = F.sum(segment_dist).over(
+            w_dvj_shape.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        )
+
+        # Use shape_dist_traveled if available, otherwise cumulative haversine
+        has_shape_dist = "shape_dist_traveled" in shapes_df.columns
+        if has_shape_dist:
+            path_points = path_points.withColumn(
+                "OnLinkOffsetMeters",
+                F.when(
+                    F.col("shape_dist_traveled").isNotNull(),
+                    F.col("shape_dist_traveled").cast("string")
+                ).otherwise(
+                    F.round(cumulative_haversine, 2).cast("string")
+                )
+            )
+        else:
+            path_points = path_points.withColumn(
+                "OnLinkOffsetMeters",
+                F.round(cumulative_haversine, 2).cast("string")
+            )
+
+        # ---- FIX: EndOfLinkSequenceNumber from stop_times ----
+        if (
+            stop_times_df is not None
+            and stop_times_df.limit(1).count() > 0
+            and "shape_dist_traveled" in stop_times_df.columns
+        ):
+            st = (
+                stop_times_df
+                .filter(F.col("shape_dist_traveled").isNotNull())
+                .select(
+                    F.col("trip_id").cast("string").alias("_st_trip_id"),
+                    F.col("stop_sequence").cast("int").alias("_stop_seq"),
+                    F.col("shape_dist_traveled").cast("double").alias("_stop_dist"),
+                )
+            )
+
+            path_points = path_points.withColumn(
+                "_offset_d", F.col("OnLinkOffsetMeters").cast("double")
+            )
+
+            # For each shape point, find the NEXT stop (smallest stop_dist >= offset)
+            path_with_st = (
+                path_points
+                .join(
+                    st,
+                    (F.col("trip_id") == F.col("_st_trip_id"))
+                    & (F.col("_stop_dist") >= F.col("_offset_d")),
+                    "left"
+                )
+            )
+
+            # Keep closest stop per shape point
+            w_closest = Window.partitionBy(
+                "DVJId", "shape_pt_sequence"
+            ).orderBy("_stop_dist")
+
+            path_points = (
+                path_with_st
+                .withColumn("_rn", F.row_number().over(w_closest))
+                .filter(F.col("_rn") == 1)
+                .withColumn("EndOfLinkSequenceNumber",
+                            F.col("_stop_seq").cast("string"))
+                .drop("_st_trip_id", "_stop_seq", "_stop_dist", "_offset_d", "_rn")
+            )
+        else:
+            path_points = path_points.withColumn(
+                "EndOfLinkSequenceNumber", F.lit(None).cast("string")
+            )
+
+        path_points = path_points.withColumn(
+            "SpeedLimitKmPerHour", F.lit(None).cast("string")
+        )
+
+        return path_points.select("DVJId", "OperatingDate", *JOURNEY_PLANNED_PATH_EXT)
 
     # ================================================================
     # INDEPENDENT TABLE BUILDERS (JourneyLink + StopPoint)
     # ================================================================
-    # PHASE 2: GPS-BASED TABLE BUILDERS
-    # ================================================================
-    # These tables are populated from VehiclePositions .pb files.
-    # JourneyLink tables: GPS points assigned to links (between stops).
-    # StopPoint tables: GPS points matched to stops, aggregated daily.
 
     def _build_link_observed_path(self, call_df: DataFrame, vp_df: DataFrame = None) -> DataFrame:
-        """JourneyLink_ObservedPath -- GPS breadcrumbs segmented by link.
-
-        A 'link' is the segment between two consecutive stops.
-        Each VP GPS point is assigned to the link whose stop departure/arrival
-        window contains that GPS timestamp.
-        """
+        """JourneyLink_ObservedPath -- GPS breadcrumbs segmented by link."""
         from htq2_gtfs.processing.models import JOURNEY_LINK_OBSERVED_PATH_COLUMNS
         empty_schema = T.StructType([T.StructField(c, T.StringType(), True) for c in JOURNEY_LINK_OBSERVED_PATH_COLUMNS])
 
         if vp_df is None or vp_df.limit(1).count() == 0:
             return self.spark.createDataFrame([], empty_schema)
 
-        # Only keep VP points that matched a journey (have DVJId)
         vp_matched = vp_df.filter(F.col("DVJId").isNotNull())
         if vp_matched.isEmpty():
             return self.spark.createDataFrame([], empty_schema)
 
-        # Get stop sequences with observed times per journey
         stops = (
             call_df
             .filter(F.col("DVJId").isNotNull())
@@ -734,7 +897,6 @@ class ViewBuilder:
             .orderBy("DVJId", "SequenceNumber")
         )
 
-        # Self-join stops to get link boundaries (stop N -> stop N+1)
         s1 = stops.alias("s1")
         s2 = stops.alias("s2")
         links = (
@@ -756,13 +918,11 @@ class ViewBuilder:
             )
         )
 
-        # Cast VP timestamp to comparable format
         vp_with_ts = vp_matched.withColumn(
             "pos_ts",
             F.from_unixtime("timestamp").cast("string")
         )
 
-        # Join GPS points to links on DVJId + timestamp within link window
         link_gps = (
             vp_with_ts.alias("v")
             .join(links.alias("l"), on=[F.col("v.DVJId") == F.col("l.DVJId")], how="inner")
@@ -804,7 +964,6 @@ class ViewBuilder:
         if halted_vp.limit(1).count() == 0:
             return self.spark.createDataFrame([], empty_schema)
 
-        # Compute bird distance (haversine between consecutive stops) per link
         from pyspark.sql.window import Window as W
         w_stops = W.partitionBy("DVJId").orderBy("SequenceNumber")
         link_dist = (
@@ -835,7 +994,6 @@ class ViewBuilder:
                 F.avg("longitude").cast("string").alias("HaltAreaCenterLongitude"),
             )
         )
-        # Join bird distance from call_df
         halt_records = halt_records.join(link_dist, "DVJId", "left")
         halt_records = halt_records.withColumn(
             "BirdDistanceFromPrevJPPMeters", F.col("_bird_distance").cast("string")
@@ -866,7 +1024,6 @@ class ViewBuilder:
         if slow_vp.limit(1).count() == 0:
             return self.spark.createDataFrame([], empty_schema)
 
-        # Compute bird distance (haversine between consecutive stops) per link
         from pyspark.sql.window import Window as W
         w_stops = W.partitionBy("DVJId").orderBy("SequenceNumber")
         link_dist = (
@@ -897,7 +1054,6 @@ class ViewBuilder:
                 F.avg("longitude").cast("string").alias("SlowAreaCenterLongitude"),
             )
         )
-        # Join bird distance from call_df
         slow_records = slow_records.join(link_dist, "DVJId", "left")
         slow_records = slow_records.withColumn(
             "BirdDistanceFromPrevJPPMeters", F.col("_bird_distance").cast("string")
@@ -911,11 +1067,7 @@ class ViewBuilder:
         return slow_records.select(*JOURNEY_LINK_SLOW_EVENT_COLUMNS)
 
     def _build_stop_position_offset(self, vp_df: DataFrame = None, stops_df: DataFrame = None) -> DataFrame:
-        """StopPoint_StopPositionOffset -- GPS position offset from planned stop location.
-
-        Matches vehicle GPS positions to nearby stops (within 200m),
-        aggregates per stop to compute offset, spread, and corrected coords.
-        """
+        """StopPoint_StopPositionOffset -- GPS position offset from planned stop location."""
         from htq2_gtfs.processing.models import STOP_POINT_POSITION_OFFSET_COLUMNS
         empty_schema = T.StructType([T.StructField(c, T.StringType(), True) for c in STOP_POINT_POSITION_OFFSET_COLUMNS])
 
@@ -928,10 +1080,9 @@ class ViewBuilder:
         if vp_valid.isEmpty():
             return self.spark.createDataFrame([], empty_schema)
 
-        R = 6371000  # Earth radius in meters
-        MATCHING_RADIUS = 200  # meters
+        R = 6371000
+        MATCHING_RADIUS = 200
 
-        # Cross-join VP positions with stops (both are small datasets)
         matched = (
             vp_valid.alias("v")
             .crossJoin(stops_df.alias("s"))
