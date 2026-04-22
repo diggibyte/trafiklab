@@ -527,6 +527,100 @@ class GTFSProcessor:
         return self.spark.createDataFrame([], schema=STOPS_SCHEMA)
 
     # ================================================================
+    # STATIC DATAFRAME BUILDERS (for ViewBuilder planned/observed paths)
+    # ================================================================
+
+    def build_static_spark_dfs(
+        self, target_date: date,
+    ) -> tuple[DataFrame, DataFrame, DataFrame]:
+        """Build shapes, trips, stop_times as Spark DataFrames from static ZIP.
+
+        Extracts files to the volume's extracted/ directory and reads
+        via spark.read.csv for efficient distributed processing.
+        Does NOT require load_static_data() to be called first.
+
+        Returns:
+            Tuple of (shapes_df, trips_df, stop_times_df).
+        """
+        SHAPES_SCHEMA = T.StructType([
+            T.StructField("shape_id", T.StringType(), True),
+            T.StructField("shape_pt_lat", T.DoubleType(), True),
+            T.StructField("shape_pt_lon", T.DoubleType(), True),
+            T.StructField("shape_pt_sequence", T.IntegerType(), True),
+            T.StructField("shape_dist_traveled", T.DoubleType(), True),
+        ])
+        TRIPS_SCHEMA = T.StructType([
+            T.StructField("route_id", T.StringType(), True),
+            T.StructField("service_id", T.StringType(), True),
+            T.StructField("trip_id", T.StringType(), True),
+            T.StructField("trip_headsign", T.StringType(), True),
+            T.StructField("trip_short_name", T.StringType(), True),
+            T.StructField("direction_id", T.IntegerType(), True),
+            T.StructField("shape_id", T.StringType(), True),
+        ])
+        STOP_TIMES_SCHEMA = T.StructType([
+            T.StructField("trip_id", T.StringType(), True),
+            T.StructField("arrival_time", T.StringType(), True),
+            T.StructField("departure_time", T.StringType(), True),
+            T.StructField("stop_id", T.StringType(), True),
+            T.StructField("stop_sequence", T.IntegerType(), True),
+            T.StructField("stop_headsign", T.StringType(), True),
+            T.StructField("pickup_type", T.IntegerType(), True),
+            T.StructField("drop_off_type", T.IntegerType(), True),
+            T.StructField("shape_dist_traveled", T.DoubleType(), True),
+            T.StructField("timepoint", T.IntegerType(), True),
+        ])
+
+        empty = (
+            self.spark.createDataFrame([], SHAPES_SCHEMA),
+            self.spark.createDataFrame([], TRIPS_SCHEMA),
+            self.spark.createDataFrame([], STOP_TIMES_SCHEMA),
+        )
+
+        static_path = self.config.static_path
+        main_zip = find_best_static_file(
+            static_path, target_date,
+            file_prefix=f"{self.config.region}_static_",
+        )
+
+        if not main_zip:
+            logger.warning("No static ZIP found — returning empty static DataFrames")
+            return empty
+
+        # Extract needed files to volume extracted/ directory
+        zip_name = os.path.basename(main_zip).replace(".zip", "")
+        extract_dir = os.path.join(static_path, "extracted", zip_name)
+        os.makedirs(extract_dir, exist_ok=True)
+
+        needed_files = ["shapes.txt", "trips.txt", "stop_times.txt"]
+        with zipfile.ZipFile(main_zip, "r") as zf:
+            for name in needed_files:
+                target_path = os.path.join(extract_dir, name)
+                if not os.path.exists(target_path):
+                    zf.extract(name, extract_dir)
+                    logger.info(f"Extracted {name} to {extract_dir}")
+
+        shapes_df = self.spark.read.csv(
+            os.path.join(extract_dir, "shapes.txt"),
+            header=True, schema=SHAPES_SCHEMA,
+        )
+        trips_df = self.spark.read.csv(
+            os.path.join(extract_dir, "trips.txt"),
+            header=True, schema=TRIPS_SCHEMA,
+        )
+        stop_times_df = self.spark.read.csv(
+            os.path.join(extract_dir, "stop_times.txt"),
+            header=True, schema=STOP_TIMES_SCHEMA,
+        )
+
+        logger.info(
+            f"Built static Spark DataFrames from {os.path.basename(main_zip)}: "
+            f"shapes, trips, stop_times"
+        )
+        return shapes_df, trips_df, stop_times_df
+
+
+    # ================================================================
     # PROTOBUF PARSING METHODS
     # ================================================================
 

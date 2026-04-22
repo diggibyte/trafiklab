@@ -155,28 +155,49 @@ def run_transform(
         logger.warning("Staging tables are empty — nothing to build")
         return {"table_row_counts": {}}
 
-    # Step 2: Read VP data for GPS tables
+    # Step 2: Load supporting data (VP, stops, shapes, trips, stop_times)
     vp_df = None
     stops_df = None
-    if config.tables in ("gps", "all"):
+    shapes_df = None
+    trips_df = None
+    stop_times_df = None
+
+    from htq2_gtfs.processing.core import GTFSProcessor
+    processor = GTFSProcessor(spark, config)
+
+    # Load VP data for observed path and GPS tables
+    if config.tables in ("base", "gps", "all"):
         fq_vp = f"{config.catalog}.{config.bronze_schema}.parsed_vehicle_positions"
         if spark.catalog.tableExists(fq_vp):
             vp_df = spark.table(fq_vp).drop("_run_id", "_parsed_timestamp")
-        # Build stops_df from static data if needed
-        from htq2_gtfs.processing.core import GTFSProcessor
-        processor = GTFSProcessor(spark, config)
+            logger.info(f"Loaded VP data from {fq_vp}")
+
+    # Build stops_df from static data for GPS tables
+    if config.tables in ("gps", "all"):
         processor.load_static_data(date.today())
         stops_df = processor._build_stops_df()
+
+    # Build static DataFrames for planned path (shapes, trips, stop_times)
+    if config.tables in ("base", "all"):
+        shapes_df, trips_df, stop_times_df = processor.build_static_spark_dfs(
+            date.today()
+        )
+        logger.info("Loaded static DataFrames for planned path")
 
     # Step 3: Build tables based on --tables parameter
     builder = ViewBuilder(spark)
 
     if config.tables == "base":
-        tables = builder.build_base_tables(journey_df, call_df)
+        tables = builder.build_base_tables(
+            journey_df, call_df, vp_df, shapes_df, trips_df, stop_times_df,
+        )
     elif config.tables == "gps":
         tables = builder.build_gps_tables(call_df, vp_df, stops_df)
     else:  # "all"
-        tables = builder.build_all(journey_df, call_df, vp_df, stops_df)
+        tables = builder.build_all(
+            journey_df, call_df, vp_df, stops_df,
+            shapes_df, trips_df, stop_times_df,
+        )
 
     # Step 4: Write tables to Delta Lake (MERGE by PK)
     table_row_counts: dict[str, int] = {}

@@ -130,10 +130,11 @@ class ViewBuilder:
         self,
         journey_df: DataFrame,
         journey_call_df: DataFrame,
-        vp_df: DataFrame = None,            
-        shapes_df: DataFrame = None,        
-        trips_df: DataFrame = None,         
-        stop_times_df: DataFrame = None,    
+        vp_df: DataFrame = None,
+        shapes_df: DataFrame = None,
+        trips_df: DataFrame = None,
+        stop_times_df: DataFrame = None,
+    ) -> dict[str, DataFrame]:
         """Build base + extension tables (16 total).
 
         Used when --tables=base. Reads from staging tables.
@@ -341,8 +342,7 @@ class ViewBuilder:
             punctuality_col(arr_delay).alias("ArrivalPunctualityText"),
             punctuality_code_col(dep_delay).alias("DeparturePunctualityCode"),
             punctuality_col(dep_delay).alias("DeparturePunctualityText"),
-            detection_completeness_state_col(completeness).alias("DetectionCompletenessState") if completeness is not None else F.lit(None).cast("string").alias("DetectionCompletenessState"),
-            (completeness if completeness is not None else F.lit(None).cast("string")).alias("DetectionCompleteness"),
+            detection_completeness_state_col(completeness).alias("DetectionCompletenessState") if completeness is not None else F.lit(None).cast("string").alias("DetectionCompletenessState"),(completeness if completeness is not None else F.lit(None).cast("string")).alias("DetectionCompleteness"),
             F.lit("1").cast(T.StringType()).alias("SignonCompletenessState"),
             F.lit("Complete").cast(T.StringType()).alias("SignOnDetectionCompleteness"),
             F.lit(None).cast(T.DoubleType()).alias("LastLinkObservedAvgSpeedKph"),
@@ -623,7 +623,7 @@ class ViewBuilder:
             .withColumn("Longitude", F.col("longitude").cast("string"))
             .withColumn("SpeedKph",
                 F.when(F.col("speed").isNotNull(),
-                       (F.col("speed") * 3.6).cast("string")))
+                       F.col("speed").cast("string")))  # VP data already in kph
             .withColumn("DirectionDegree",
                 F.when(F.col("bearing").isNotNull(), F.col("bearing").cast("string"))
                  .otherwise(F.lit(None).cast("string")))
