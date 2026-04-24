@@ -1,17 +1,9 @@
-# HTQ2 GTFS Realtime Pipeline Job (v3.1.0 — Auto Loader)
+# HTQ2 GTFS Realtime Pipeline Job (v3.1.0)
 #
-# Main scheduled pipeline for processing GTFS Realtime data.
-# Runs every 15 minutes to process new .pb files from Volume.
+# 6-task DAG: ingest -> prep -> base/gps (parallel) -> views -> quality
+# Auto Loader for exactly-once file processing
 #
-# v3.1.0 CHANGES:
-#   - Removed ingest_static task (now a separate manual job)
-#   - Added Auto Loader checkpoint path for exactly-once file processing
-#   - parse_and_enrich uses cloudFiles + binaryFile (no foreachBatch)
-#   - Added custom_tags for Azure Cost Management tracking
-#
-# TASK DAG:
-#   ingest_realtime -> parse_and_enrich -> build_base_tables -> create_all_views -> quality_gate
-#                                      -> build_gps_tables  ->
+# Schedule: dev=PAUSED, prod=every 10 min
 
 resources:
   jobs:
@@ -20,15 +12,16 @@ resources:
       max_concurrent_runs: 1
       tags:
         project: htq2
-        team: diggibyte
+        application: htq2-gtfs-pipeline
+        cost_center: transit-analytics
+        owner: data-engineering
         pipeline_type: realtime
         version: "3.1.0"
       schedule:
-        quartz_cron_expression: "0 */15 * * * ?"  # Every 15 minutes
+        quartz_cron_expression: "0 */10 * * * ?"
         timezone_id: "Europe/Stockholm"
         pause_status: PAUSED
 
-      # Single shared single-node cluster for all tasks
       job_clusters:
         - job_cluster_key: htq2_cluster
           new_cluster:
@@ -42,15 +35,16 @@ resources:
               spark.sql.adaptive.enabled: "true"
             custom_tags:
               project: htq2
-              team: diggibyte
+              application: htq2-gtfs-pipeline
+              cost_center: transit-analytics
+              owner: data-engineering
               env: "${bundle.target}"
               pipeline_type: realtime
-              compute_type: classic_job_cluster
+              managed_by: databricks-asset-bundle
             enable_elastic_disk: true
             is_single_node: true
 
       tasks:
-        # --- LAYER 1: INGESTION (realtime only -- static is separate job) ---
         - task_key: ingest_realtime
           job_cluster_key: htq2_cluster
           python_wheel_task:
@@ -76,7 +70,6 @@ resources:
           max_retries: 2
           min_retry_interval_millis: 30000
 
-        # --- LAYER 2: PREP (Auto Loader -- exactly-once file processing) ---
         - task_key: parse_and_enrich
           depends_on:
             - task_key: ingest_realtime
@@ -104,7 +97,6 @@ resources:
             - pypi:
                 package: "protobuf>=4.25.0"
 
-        # --- LAYER 3: SILVER (parallel, depend on prep) ---
         - task_key: build_base_tables
           depends_on:
             - task_key: parse_and_enrich
@@ -158,7 +150,6 @@ resources:
           libraries:
             - whl: ../dist/*.whl
 
-        # --- LAYER 4: QUALITY (depends on all Layer 3 tasks) ---
         - task_key: quality_gate
           depends_on:
             - task_key: build_base_tables

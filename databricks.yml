@@ -3,13 +3,13 @@ bundle:
 
 variables:
   catalog:
-    description: "Unity Catalog catalog name for this environment"
+    description: "Unity Catalog catalog name"
     default: htq2_dev
   volume_path:
-    description: "Base path for the raw data volume"
+    description: "Volume name for raw data"
     default: trafiklab_raw
   checkpoint_path:
-    description: "DBFS path for Auto Loader checkpoint (exactly-once file tracking)"
+    description: "Auto Loader checkpoint (exactly-once)"
     default: "dbfs:/htq2/checkpoints/autoloader"
 
 artifacts:
@@ -29,19 +29,6 @@ targets:
       host: ${workspace.host}
     variables:
       catalog: htq2_dev
-
-  staging:
-    workspace:
-      host: ${workspace.host}
-    variables:
-      catalog: htq2_staging
-    resources:
-      jobs:
-        htq2_gtfs_pipeline:
-          schedule:
-            quartz_cron_expression: "0 */15 * * * ?"
-            timezone_id: "Europe/Stockholm"
-            pause_status: UNPAUSED
 
   prod:
     workspace:
