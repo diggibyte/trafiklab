@@ -1,7 +1,10 @@
 """Entry point for the HTQ2 GTFS Transform task (Silver Build).
 
-Layer 3 in the 8-task architecture. Reads from staging tables
+Layer 3 in the pipeline architecture. Reads from staging tables
 (bronze.parsed_journey, bronze.parsed_call) and builds Silver tables.
+
+v3.0: Reads only the LATEST prep run's data from staging (run_id
+filter) instead of all accumulated rows. Writes via APPEND.
 
 Supports --tables parameter:
   base: journey + journey_call + 14 extension tables (16 total)
@@ -22,8 +25,9 @@ import uuid
 from datetime import date
 
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from htq2_gtfs.config import parse_transform_args
+from htq2_gtfs.config import METADATA_TABLE, parse_transform_args
 from htq2_gtfs.helpers.logging_config import get_logger
 from htq2_gtfs.processing.view_builder import ViewBuilder
 from htq2_gtfs.processing.writer import (
@@ -33,6 +37,29 @@ from htq2_gtfs.processing.writer import (
 )
 
 logger = get_logger(__name__)
+
+
+def _get_latest_prep_run_id(spark: SparkSession, catalog: str, silver_schema: str) -> str | None:
+    """Get the run_id of the most recent successful prep run.
+
+    Reads from _pipeline_metadata table. Returns None if the table
+    doesn't exist or is empty.
+    """
+    fq_meta = f"{catalog}.{silver_schema}.{METADATA_TABLE}"
+    try:
+        if not spark.catalog.tableExists(fq_meta):
+            return None
+        row = (
+            spark.table(fq_meta)
+            .filter(F.col("status") == "success")
+            .orderBy(F.col("run_timestamp").desc())
+            .select("run_id")
+            .first()
+        )
+        return row["run_id"] if row else None
+    except Exception as e:
+        logger.warning(f"Could not read latest prep run_id: {e}")
+        return None
 
 
 def _print_summary(
@@ -127,14 +154,25 @@ def run_transform(
 ) -> dict:
     """Execute the Silver build pipeline.
 
-    Reads from staging tables (written by prep task) instead of
-    parsing raw .pb files. Routes to base or GPS builders based
-    on --tables parameter.
+    v3.0: Reads ONLY the latest prep run's data from staging, not
+    all accumulated rows. This fixes the 15-min build time and
+    eliminates "multiple source rows matched" MERGE warnings.
     """
     # Step 0: Ensure independent table schemas exist
     ensure_all_table_schemas(spark, config)
 
-    # Step 1: Read from staging tables
+    # Step 1: Determine which prep run to process
+    prep_run_id = _get_latest_prep_run_id(
+        spark, config.catalog, config.silver_schema
+    )
+    if prep_run_id:
+        logger.info(f"Filtering staging to prep run_id={prep_run_id}")
+    else:
+        logger.warning(
+            "No prep run_id found in metadata — reading all staging data (first run?)"
+        )
+
+    # Step 2: Read from staging tables (filtered to current run)
     fq_journey = f"{config.catalog}.{config.bronze_schema}.parsed_journey"
     fq_call = f"{config.catalog}.{config.bronze_schema}.parsed_call"
 
@@ -147,15 +185,27 @@ def run_transform(
     parsed_journey = spark.table(fq_journey)
     parsed_call = spark.table(fq_call)
 
+    # Filter to latest prep run only (v3: prevents reading all history)
+    if prep_run_id:
+        parsed_journey = parsed_journey.filter(F.col("_run_id") == prep_run_id)
+        parsed_call = parsed_call.filter(F.col("_run_id") == prep_run_id)
+
     # Drop staging metadata columns before building Silver tables
     journey_df = parsed_journey.drop("_run_id", "_parsed_timestamp")
     call_df = parsed_call.drop("_run_id", "_parsed_timestamp")
 
-    if journey_df.isEmpty() and call_df.isEmpty():
+    j_count = journey_df.count()
+    c_count = call_df.count()
+    logger.info(
+        f"Staging data: {j_count:,} journeys, {c_count:,} calls"
+        + (f" (run_id={prep_run_id})" if prep_run_id else " (all runs)")
+    )
+
+    if j_count == 0 and c_count == 0:
         logger.warning("Staging tables are empty — nothing to build")
         return {"table_row_counts": {}}
 
-    # Step 2: Load supporting data (VP, stops, shapes, trips, stop_times)
+    # Step 3: Load supporting data (VP, stops, shapes, trips, stop_times)
     vp_df = None
     stops_df = None
     shapes_df = None
@@ -169,7 +219,10 @@ def run_transform(
     if config.tables in ("base", "gps", "all"):
         fq_vp = f"{config.catalog}.{config.bronze_schema}.parsed_vehicle_positions"
         if spark.catalog.tableExists(fq_vp):
-            vp_df = spark.table(fq_vp).drop("_run_id", "_parsed_timestamp")
+            vp_df = spark.table(fq_vp)
+            if prep_run_id:
+                vp_df = vp_df.filter(F.col("_run_id") == prep_run_id)
+            vp_df = vp_df.drop("_run_id", "_parsed_timestamp")
             logger.info(f"Loaded VP data from {fq_vp}")
 
     # Build stops_df from static data for GPS tables
@@ -184,7 +237,7 @@ def run_transform(
         )
         logger.info("Loaded static DataFrames for planned path")
 
-    # Step 3: Build tables based on --tables parameter
+    # Step 4: Build tables based on --tables parameter
     builder = ViewBuilder(spark)
 
     if config.tables == "base":
@@ -199,7 +252,7 @@ def run_transform(
             shapes_df, trips_df, stop_times_df,
         )
 
-    # Step 4: Write tables to Delta Lake (MERGE by PK)
+    # Step 5: Write tables to Delta Lake (APPEND)
     table_row_counts: dict[str, int] = {}
     for table_name, table_df in tables.items():
         if table_df is not None:
@@ -210,7 +263,7 @@ def run_transform(
             )
             table_row_counts[table_name] = count
 
-    # Step 5: Ensure table properties
+    # Step 6: Ensure table properties
     ensure_table_properties(spark, config)
 
     logger.info(

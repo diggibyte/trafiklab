@@ -1,13 +1,16 @@
-# HTQ2 GTFS Realtime Pipeline Job (v3.1.0 — Auto Loader)
+# HTQ2 GTFS Realtime Pipeline Job — SERVERLESS VARIANT
 #
-# Main scheduled pipeline for processing GTFS Realtime data.
-# Runs every 15 minutes to process new .pb files from Volume.
+# Same 6-task DAG as htq2_pipeline_job.yml but using SERVERLESS compute.
+# Used for cost/performance comparison against classic DS4_v2 job clusters.
 #
-# v3.1.0 CHANGES:
-#   - Removed ingest_static task (now a separate manual job)
-#   - Added Auto Loader checkpoint path for exactly-once file processing
-#   - parse_and_enrich uses cloudFiles + binaryFile (no foreachBatch)
-#   - Added custom_tags for Azure Cost Management tracking
+# KEY DIFFERENCES from classic:
+#   - No job_clusters section
+#   - Each task uses environment_key instead of job_cluster_key
+#   - Dependencies defined in environments.spec.dependencies (not task-level libraries)
+#   - No cluster startup time (serverless pools are pre-warmed)
+#
+# NOTE: Auto Loader (cloudFiles) requires a checkpoint on DBFS. Serverless
+# compute has access to DBFS, so the checkpoint path works as-is.
 #
 # TASK DAG:
 #   ingest_realtime -> parse_and_enrich -> build_base_tables -> create_all_views -> quality_gate
@@ -15,44 +18,37 @@
 
 resources:
   jobs:
-    htq2_gtfs_pipeline:
-      name: "htq2_gtfs_pipeline_${bundle.target}"
+    htq2_gtfs_pipeline_serverless:
+      name: "htq2_gtfs_pipeline_serverless_${bundle.target}"
       max_concurrent_runs: 1
       tags:
         project: htq2
         team: diggibyte
         pipeline_type: realtime
+        compute_type: serverless
         version: "3.1.0"
-      schedule:
-        quartz_cron_expression: "0 */15 * * * ?"  # Every 15 minutes
-        timezone_id: "Europe/Stockholm"
-        pause_status: PAUSED
 
-      # Single shared single-node cluster for all tasks
-      job_clusters:
-        - job_cluster_key: htq2_cluster
-          new_cluster:
-            data_security_mode: DATA_SECURITY_MODE_AUTO
-            kind: CLASSIC_PREVIEW
-            spark_version: "17.3.x-scala2.13"
-            node_type_id: "Standard_DS4_v2"
-            num_workers: 0
-            spark_conf:
-              spark.master: "local[*]"
-              spark.sql.adaptive.enabled: "true"
-            custom_tags:
-              project: htq2
-              team: diggibyte
-              env: "${bundle.target}"
-              pipeline_type: realtime
-              compute_type: classic_job_cluster
-            enable_elastic_disk: true
-            is_single_node: true
+      # Serverless environments (replaces job_clusters)
+      environments:
+        - environment_key: htq2_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/*.whl
+              - "gtfs-realtime-bindings>=1.0.0"
+              - "requests>=2.31.0"
+              - "protobuf>=4.25.0"
+
+        - environment_key: htq2_env_light
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/*.whl
 
       tasks:
-        # --- LAYER 1: INGESTION (realtime only -- static is separate job) ---
+        # --- LAYER 1: INGESTION ---
         - task_key: ingest_realtime
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: ingest
@@ -65,22 +61,14 @@ resources:
               - "${var.volume_path}"
               - "--run_mode"
               - "realtime"
-          libraries:
-            - whl: ../dist/*.whl
-            - pypi:
-                package: "gtfs-realtime-bindings>=1.0.0"
-            - pypi:
-                package: "requests>=2.31.0"
-            - pypi:
-                package: "protobuf>=4.25.0"
           max_retries: 2
           min_retry_interval_millis: 30000
 
-        # --- LAYER 2: PREP (Auto Loader -- exactly-once file processing) ---
+        # --- LAYER 2: PREP (Auto Loader) ---
         - task_key: parse_and_enrich
           depends_on:
             - task_key: ingest_realtime
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: prep
@@ -95,20 +83,12 @@ resources:
               - "${var.volume_path}"
               - "--checkpoint_path"
               - "${var.checkpoint_path}"
-          libraries:
-            - whl: ../dist/*.whl
-            - pypi:
-                package: "gtfs-realtime-bindings>=1.0.0"
-            - pypi:
-                package: "requests>=2.31.0"
-            - pypi:
-                package: "protobuf>=4.25.0"
 
-        # --- LAYER 3: SILVER (parallel, depend on prep) ---
+        # --- LAYER 3: SILVER (parallel) ---
         - task_key: build_base_tables
           depends_on:
             - task_key: parse_and_enrich
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env_light
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: transform
@@ -121,13 +101,11 @@ resources:
               - "silver"
               - "--tables"
               - "base"
-          libraries:
-            - whl: ../dist/*.whl
 
         - task_key: build_gps_tables
           depends_on:
             - task_key: parse_and_enrich
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env_light
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: transform
@@ -140,13 +118,11 @@ resources:
               - "silver"
               - "--tables"
               - "gps"
-          libraries:
-            - whl: ../dist/*.whl
 
         - task_key: create_all_views
           depends_on:
             - task_key: build_base_tables
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env_light
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: views
@@ -155,16 +131,14 @@ resources:
               - "${var.catalog}"
               - "--schema"
               - "silver"
-          libraries:
-            - whl: ../dist/*.whl
 
-        # --- LAYER 4: QUALITY (depends on all Layer 3 tasks) ---
+        # --- LAYER 4: QUALITY ---
         - task_key: quality_gate
           depends_on:
             - task_key: build_base_tables
             - task_key: build_gps_tables
             - task_key: create_all_views
-          job_cluster_key: htq2_cluster
+          environment_key: htq2_env_light
           python_wheel_task:
             package_name: htq2_gtfs
             entry_point: validate
@@ -175,5 +149,3 @@ resources:
               - "silver"
               - "--tables"
               - "all"
-          libraries:
-            - whl: ../dist/*.whl

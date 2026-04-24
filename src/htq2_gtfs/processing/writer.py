@@ -1,8 +1,14 @@
 """Delta Lake write utilities for HTQ2 GTFS pipeline.
 
-v2.0: MERGE by PK for idempotent writes (replaces append-only).
+v3.0: APPEND-only writes (reverted from MERGE — matches Synapse).
 Handles table creation, schema alignment, and incremental writes
 for all 22 Silver tables and the SQL views.
+
+Design decision: GTFS-RT data is event data (each .pb snapshot is a
+unique observation). APPEND is the correct strategy — watermark / Auto
+Loader prevents reprocessing the same files, so no duplicates arise.
+MERGE was removed because it caused "multiple source rows matched"
+warnings and 15-min build times.
 """
 
 from __future__ import annotations
@@ -77,10 +83,11 @@ def write_table(
     table_name: str,
     source_files: list[str] | None = None,
 ) -> int:
-    """Write a DataFrame to a Silver Delta table using MERGE by PK.
+    """APPEND a DataFrame to a Silver Delta table.
 
-    v2.0: Uses MERGE for idempotent writes. Falls back to saveAsTable
-    for new tables or when PK info is unavailable.
+    v3.0: Pure APPEND mode (matching Synapse's proven strategy).
+    Watermark / Auto Loader prevents reprocessing of the same .pb files,
+    so duplicate rows cannot arise from the pipeline itself.
 
     Args:
         df: DataFrame to write.
@@ -91,8 +98,6 @@ def write_table(
     Returns:
         Number of rows written.
     """
-    from delta.tables import DeltaTable
-
     fq_table = config.silver_table(table_name)
 
     # Add metadata columns
@@ -118,43 +123,18 @@ def write_table(
         logger.warning(f"0 rows for {table_name} — skipping write")
         return 0
 
-    # Determine PK columns for MERGE
-    pk_cols = table_def.primary_keys if table_def else None
-
-    # If table doesn't exist yet, create it with saveAsTable
+    # Create table on first run, otherwise APPEND
     if not df.sparkSession.catalog.tableExists(fq_table):
         df.write.format("delta").mode("overwrite").option(
             "mergeSchema", "true"
         ).saveAsTable(fq_table)
         logger.info(f"Created + wrote {row_count:,} rows to {fq_table}")
-        return row_count
+    else:
+        df.write.format("delta").mode("append").option(
+            "mergeSchema", "true"
+        ).saveAsTable(fq_table)
+        logger.info(f"Appended {row_count:,} rows to {fq_table}")
 
-    # MERGE by PK for idempotent writes
-    if pk_cols:
-        merge_condition = " AND ".join(
-            [f"target.{k} = source.{k}" for k in pk_cols]
-        )
-        try:
-            target_table = DeltaTable.forName(df.sparkSession, fq_table)
-            (
-                target_table.alias("target")
-                .merge(df.alias("source"), merge_condition)
-                .whenMatchedUpdateAll()
-                .whenNotMatchedInsertAll()
-                .execute()
-            )
-            logger.info(f"Merged {row_count:,} rows into {fq_table} (PK: {pk_cols})")
-            return row_count
-        except Exception as e:
-            logger.warning(
-                f"MERGE failed for {fq_table}, falling back to append: {e}"
-            )
-
-    # Fallback: append mode
-    df.write.format("delta").mode("append").option(
-        "mergeSchema", "true"
-    ).saveAsTable(fq_table)
-    logger.info(f"Appended {row_count:,} rows to {fq_table}")
     return row_count
 
 

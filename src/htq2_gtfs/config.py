@@ -4,7 +4,8 @@ All entry points receive configuration via CLI arguments passed from
 the Databricks job YAML. This module provides argument parsing and
 typed configuration dataclasses.
 
-v2.0: 5 entry points (ingest, prep, transform, views, validate)
+v3.1: Added Auto Loader checkpoint_path to PrepConfig.
+      6 entry points (ingest, prep, transform, views, validate, load_static)
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from datetime import date, datetime
 from typing import Optional
 
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────────────
 
 REGION = "skane"
 TRAFIKLAB_REALTIME_BASE = "https://opendata.samtrafiken.se/gtfs-rt/{region}"
@@ -47,7 +48,10 @@ HTTP_TIMEOUT_SECONDS = 30
 METADATA_TABLE = "_pipeline_metadata"
 QUALITY_RESULTS_TABLE = "_quality_results"
 
-# ── Table Group Constants (for --tables parameter) ───────────────────────
+# Default Auto Loader checkpoint path (DBFS, persistent across runs)
+DEFAULT_CHECKPOINT_PATH = "dbfs:/htq2/checkpoints/autoloader"
+
+# ── Table Group Constants (for --tables parameter) ───────────────────
 
 BASE_TABLES = [
     "journey",
@@ -111,11 +115,15 @@ class IngestConfig:
 
 @dataclass(frozen=True)
 class PrepConfig:
-    """Configuration for the prep entry point (parse_and_enrich)."""
+    """Configuration for the prep entry point (parse_and_enrich).
+
+    v3.1: Added checkpoint_path for Auto Loader exactly-once processing.
+    """
     catalog: str
     bronze_schema: str = "bronze"
     silver_schema: str = "silver"
     volume: str = "trafiklab_raw"
+    checkpoint_path: str = DEFAULT_CHECKPOINT_PATH  # Auto Loader checkpoint
     region: str = REGION
 
     @property
@@ -129,6 +137,16 @@ class PrepConfig:
     @property
     def static_path(self) -> str:
         return f"{self.volume_path}/static"
+
+    @property
+    def schema_checkpoint(self) -> str:
+        """Checkpoint path for Auto Loader schema inference."""
+        return f"{self.checkpoint_path}/schema"
+
+    @property
+    def data_checkpoint(self) -> str:
+        """Checkpoint path for Auto Loader stream state."""
+        return f"{self.checkpoint_path}/data"
 
     def silver_table(self, table_name: str) -> str:
         """Return fully qualified silver table name (for metadata)."""
@@ -199,7 +217,23 @@ class QualityConfig:
             return SILVER_TABLES
 
 
-# ── Argument Parsers ─────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class StaticLoaderConfig:
+    """Configuration for the static GTFS loader entry point (manual job)."""
+    catalog: str
+    schema: str = "bronze"
+    volume: str = "trafiklab_raw"
+
+    @property
+    def volume_path(self) -> str:
+        return f"/Volumes/{self.catalog}/{self.schema}/{self.volume}"
+
+    @property
+    def static_path(self) -> str:
+        return f"{self.volume_path}/static"
+
+
+# ── Argument Parsers ───────────────────────────────────────────────────────
 
 def parse_ingest_args(args: Optional[list[str]] = None) -> IngestConfig:
     """Parse CLI arguments for the ingestion entry point."""
@@ -231,12 +265,17 @@ def parse_ingest_args(args: Optional[list[str]] = None) -> IngestConfig:
 
 
 def parse_prep_args(args: Optional[list[str]] = None) -> PrepConfig:
-    """Parse CLI arguments for the prep entry point."""
+    """Parse CLI arguments for the prep entry point.
+
+    v3.1: Added --checkpoint_path for Auto Loader.
+    """
     parser = argparse.ArgumentParser(description="HTQ2 GTFS Parse & Enrich")
     parser.add_argument("--catalog", required=True, help="Unity Catalog catalog name")
     parser.add_argument("--bronze_schema", default="bronze", help="Bronze schema")
     parser.add_argument("--silver_schema", default="silver", help="Silver schema")
     parser.add_argument("--volume", default="trafiklab_raw", help="Volume name")
+    parser.add_argument("--checkpoint_path", default=DEFAULT_CHECKPOINT_PATH,
+                        help="Auto Loader checkpoint path (DBFS)")
     parser.add_argument("--region", default=REGION, help="GTFS region")
 
     parsed = parser.parse_args(args or sys.argv[1:])
@@ -246,6 +285,7 @@ def parse_prep_args(args: Optional[list[str]] = None) -> PrepConfig:
         bronze_schema=parsed.bronze_schema,
         silver_schema=parsed.silver_schema,
         volume=parsed.volume,
+        checkpoint_path=parsed.checkpoint_path,
         region=parsed.region,
     )
 
@@ -303,4 +343,20 @@ def parse_quality_args(args: Optional[list[str]] = None) -> QualityConfig:
         catalog=parsed.catalog,
         schema=parsed.schema,
         tables=parsed.tables,
+    )
+
+
+def parse_static_loader_args(args: Optional[list[str]] = None) -> StaticLoaderConfig:
+    """Parse CLI arguments for the static GTFS loader entry point."""
+    parser = argparse.ArgumentParser(description="HTQ2 Static GTFS Loader")
+    parser.add_argument("--catalog", required=True, help="Unity Catalog catalog name")
+    parser.add_argument("--schema", default="bronze", help="Bronze schema")
+    parser.add_argument("--volume", default="trafiklab_raw", help="Volume name")
+
+    parsed = parser.parse_args(args or sys.argv[1:])
+
+    return StaticLoaderConfig(
+        catalog=parsed.catalog,
+        schema=parsed.schema,
+        volume=parsed.volume,
     )

@@ -8,6 +8,9 @@ variables:
   volume_path:
     description: "Base path for the raw data volume"
     default: trafiklab_raw
+  checkpoint_path:
+    description: "DBFS path for Auto Loader checkpoint (exactly-once file tracking)"
+    default: "dbfs:/htq2/checkpoints/autoloader"
 
 artifacts:
   htq2_gtfs_wheel:
@@ -36,7 +39,7 @@ targets:
       jobs:
         htq2_gtfs_pipeline:
           schedule:
-            quartz_cron_expression: "0 0 * * * ?"
+            quartz_cron_expression: "0 */15 * * * ?"
             timezone_id: "Europe/Stockholm"
             pause_status: UNPAUSED
 

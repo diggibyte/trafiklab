@@ -49,6 +49,23 @@ class ViewBuilder:
     def __init__(self, spark: SparkSession) -> None:
         self.spark = spark
 
+    @staticmethod
+    def _safe_cache(df: DataFrame) -> DataFrame:
+        """Cache DataFrame if supported (skips on serverless compute)."""
+        try:
+            df.cache()
+        except Exception:
+            pass  # PERSIST not supported on serverless — silently skip
+        return df
+
+    @staticmethod
+    def _safe_unpersist(df: DataFrame) -> None:
+        """Unpersist DataFrame if supported (skips on serverless compute)."""
+        try:
+            df.unpersist()
+        except Exception:
+            pass
+
     # ================================================================
     # TOP-LEVEL ORCHESTRATORS (FIXED)
     # ================================================================
@@ -76,8 +93,8 @@ class ViewBuilder:
         """
         tables: dict[str, DataFrame] = {}
 
-        journey_df.cache()
-        journey_call_df.cache()
+        self._safe_cache(journey_df)
+        self._safe_cache(journey_call_df)
 
         try:
             # Base tables
@@ -117,8 +134,8 @@ class ViewBuilder:
             tables["stop_point_large_offset"] = self._build_stop_large_offset(vp_df, stops_df)
 
         finally:
-            journey_df.unpersist()
-            journey_call_df.unpersist()
+            self._safe_unpersist(journey_df)
+            self._safe_unpersist(journey_call_df)
 
         logger.info(
             f"Built {len(tables)} tables",
@@ -141,8 +158,8 @@ class ViewBuilder:
         """
         tables: dict[str, DataFrame] = {}
 
-        journey_df.cache()
-        journey_call_df.cache()
+        self._safe_cache(journey_df)
+        self._safe_cache(journey_call_df)
 
         try:
             # Base tables
@@ -174,8 +191,8 @@ class ViewBuilder:
             )
 
         finally:
-            journey_df.unpersist()
-            journey_call_df.unpersist()
+            self._safe_unpersist(journey_df)
+            self._safe_unpersist(journey_call_df)
 
         logger.info(f"Built {len(tables)} base+extension tables")
         return tables

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "htq2_gtfs"
-version = "2.0.0"
-description = "HTQ2 GTFS Realtime pipeline for Skånetrafiken — 8-task decomposed architecture"
+version = "3.1.0"
+description = "HTQ2 GTFS Realtime pipeline for Skånetrafiken — v3.1 Auto Loader + separate static job"
 requires-python = ">=3.10"
 authors = [
     {name = "DiggiByte Solutions", email = "dev@diggibyte.com"}
@@ -31,13 +31,14 @@ dev = [
     "mypy>=1.8.0",
 ]
 
-# Entry points for Databricks python_wheel_task (5 total)
+# Entry points for Databricks python_wheel_task (6 total)
 [project.entry-points."htq2_gtfs"]
-ingest    = "htq2_gtfs.ingestion.main:main"
-prep      = "htq2_gtfs.prep.main:main"
-transform = "htq2_gtfs.processing.main:main"
-views     = "htq2_gtfs.views.main:main"
-validate  = "htq2_gtfs.quality.main:main"
+ingest      = "htq2_gtfs.ingestion.main:main"
+prep        = "htq2_gtfs.prep.main:main"
+transform   = "htq2_gtfs.processing.main:main"
+views       = "htq2_gtfs.views.main:main"
+validate    = "htq2_gtfs.quality.main:main"
+load_static = "htq2_gtfs.ingestion.static_loader:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

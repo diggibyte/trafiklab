@@ -1,0 +1,75 @@
+# HTQ2 Static GTFS Loader Job (v3.1.0)
+#
+# Separate workflow for loading static GTFS data from ZIP files into
+# bronze Delta tables. MANUAL trigger only -- run when a new static
+# GTFS ZIP is uploaded to the Volume.
+#
+# NOT part of the 15-min scheduled pipeline. Static data changes
+# infrequently (route/stop schedule updates from Trafiklab).
+#
+# Bronze tables created (OVERWRITE mode):
+#   - htq2_{env}.bronze.static_routes       (584 rows)
+#   - htq2_{env}.bronze.static_trips        (67K rows)
+#   - htq2_{env}.bronze.static_stops        (10K rows)
+#   - htq2_{env}.bronze.static_stop_times   (1.4M rows)
+#   - htq2_{env}.bronze.static_shapes       (2.1M rows)
+#   - htq2_{env}.bronze.static_dvj_mapping  (1.8M rows)
+#
+# Compute: Standard_DS2_v2 (2 cores, 7GB) — sufficient for CSV read/write
+# Previous: DS3_v2 (4 cores, 14GB) — overprovisioned for this workload
+
+resources:
+  jobs:
+    htq2_static_loader:
+      name: "htq2_static_loader_${bundle.target}"
+      max_concurrent_runs: 1
+      # NO SCHEDULE — manual trigger only
+      tags:
+        project: htq2
+        team: diggibyte
+        pipeline_type: static_loader
+        trigger: manual
+        version: "3.1.0"
+
+      # Smallest viable single-node cluster — CSV read + Delta write only
+      job_clusters:
+        - job_cluster_key: static_cluster
+          new_cluster:
+            data_security_mode: DATA_SECURITY_MODE_AUTO
+            kind: CLASSIC_PREVIEW
+            spark_version: "17.3.x-scala2.13"
+            node_type_id: "Standard_DS2_v2"  # 2 cores, 7GB — reduced from DS3_v2
+            num_workers: 0
+            spark_conf:
+              spark.master: "local[*]"
+              spark.sql.adaptive.enabled: "true"
+            custom_tags:
+              project: htq2
+              team: diggibyte
+              env: "${bundle.target}"
+              pipeline_type: static_loader
+              compute_type: classic_job_cluster
+            enable_elastic_disk: true
+            is_single_node: true
+
+      tasks:
+        - task_key: load_static_gtfs
+          job_cluster_key: static_cluster
+          python_wheel_task:
+            package_name: htq2_gtfs
+            entry_point: load_static
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "bronze"
+              - "--volume"
+              - "${var.volume_path}"
+          libraries:
+            - whl: ../dist/*.whl
+          description: |
+            Load static GTFS data from ZIP files in the Volume:
+            - skane_static_*.zip -> routes, trips, stops, stop_times, shapes
+            - skane_extra_*.zip -> DVJId mapping (trips_dated_vehicle_journey.txt)
+            
+            All tables are written in OVERWRITE mode (full snapshot per load).
