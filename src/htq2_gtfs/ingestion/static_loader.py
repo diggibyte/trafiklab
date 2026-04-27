@@ -1,14 +1,10 @@
 """Entry point for the HTQ2 Static GTFS Loader (manual job).
 
-Separate workflow — triggered manually when a new static GTFS ZIP
-is uploaded to the Volume. Not part of the 15-min scheduled pipeline.
+Fully self-contained: downloads static GTFS ZIPs from Trafiklab API,
+saves to Volume, extracts CSVs, loads to 6 bronze Delta tables,
+then cleans up.
 
-Reads skane_static_*.zip and skane_extra_*.zip from the Volume,
-extracts CSV files INTO the Volume (not local /tmp — avoids
-'cannot access shared' on job clusters), writes them to 6 bronze
-Delta tables with OVERWRITE mode, then cleans up ALL files:
-both extracted CSVs and source ZIPs.
-
+v3.2: Added API download step — no longer requires manual ZIP upload.
 v3.1: Fixed extraction path to use Volume instead of tempfile.
 
 Usage (via python_wheel_task):
@@ -23,12 +19,18 @@ import shutil
 import sys
 import time
 import zipfile
+from datetime import date
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from htq2_gtfs.config import parse_static_loader_args
+from htq2_gtfs.config import (
+    SECRET_KEY_STATIC,
+    SECRET_SCOPE,
+    parse_static_loader_args,
+)
 from htq2_gtfs.helpers.logging_config import get_logger
+from htq2_gtfs.ingestion.trafiklab_client import TrafiklabClient
 
 logger = get_logger(__name__)
 
@@ -44,11 +46,7 @@ STATIC_TABLE_MAP = {
 
 
 def _find_latest_zip(volume_path: str, prefix: str) -> str | None:
-    """Find the latest ZIP file by date in filename.
-
-    Filenames follow pattern: {prefix}YYYY-MM-DD.zip
-    Returns full path to the latest file, or None.
-    """
+    """Find the latest ZIP file by date in filename."""
     try:
         candidates = sorted(
             [
@@ -64,17 +62,78 @@ def _find_latest_zip(volume_path: str, prefix: str) -> str | None:
         return None
 
 
+def _download_static_zips(
+    static_path: str,
+    region: str = "skane",
+) -> dict[str, str]:
+    """Download static GTFS ZIPs from Trafiklab API to the Volume.
+
+    Uses Databricks Secrets for the API key. Downloads both the main
+    static ZIP and the extra ZIP (DVJId mapping).
+
+    Returns:
+        Dict mapping filename to full path of downloaded files.
+    """
+    spark = SparkSession.builder.getOrCreate()
+
+    try:
+        from pyspark.dbutils import DBUtils
+        dbutils = DBUtils(spark)
+        static_key = dbutils.secrets.get(scope=SECRET_SCOPE, key=SECRET_KEY_STATIC)
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot get static API key from secrets scope '{SECRET_SCOPE}': {e}"
+        ) from e
+
+    os.makedirs(static_path, exist_ok=True)
+    today = date.today().isoformat()
+
+    client = TrafiklabClient(
+        realtime_api_key="",  # Not needed for static
+        static_api_key=static_key,
+        region=region,
+    )
+
+    downloaded: dict[str, str] = {}
+
+    try:
+        static_data = client.fetch_all_static()
+
+        for api_filename, content in static_data.items():
+            # Rename with date: skane.zip -> skane_static_2026-04-27.zip
+            if "_extra" in api_filename or api_filename.endswith("_extra.zip"):
+                target_name = f"{region}_extra_{today}.zip"
+            else:
+                target_name = f"{region}_static_{today}.zip"
+
+            target_path = os.path.join(static_path, target_name)
+
+            with open(target_path, "wb") as f:
+                f.write(content)
+
+            downloaded[target_name] = target_path
+            logger.info(
+                f"Downloaded {target_name} ({len(content):,} bytes)"
+            )
+    finally:
+        client.close()
+
+    if not downloaded:
+        raise RuntimeError(
+            "No static files downloaded from Trafiklab API. "
+            "Check API key and network connectivity."
+        )
+
+    return downloaded
+
+
 def _extract_and_read(
     spark: SparkSession,
     zip_path: str,
     csv_name: str,
     extract_dir: str,
 ) -> "pyspark.sql.DataFrame | None":
-    """Extract a CSV from a ZIP into the Volume and read as Spark DataFrame.
-
-    Extracts to a _tmp subdirectory inside the Volume (accessible by
-    all Spark workers). Caller is responsible for cleaning up extract_dir.
-    """
+    """Extract a CSV from a ZIP into the Volume and read as Spark DataFrame."""
     with zipfile.ZipFile(zip_path, "r") as zf:
         if csv_name not in zf.namelist():
             logger.warning(
@@ -86,7 +145,6 @@ def _extract_and_read(
     csv_path = os.path.join(extract_dir, csv_name)
     logger.info(f"  Extracted {csv_name} to {csv_path}")
 
-    # Read from Volume path — accessible by all workers (no file: prefix)
     df = (
         spark.read.option("header", "true")
         .option("inferSchema", "true")
@@ -133,7 +191,10 @@ def _print_summary(
 
 
 def main() -> None:
-    """Entry point for Databricks python_wheel_task."""
+    """Entry point for Databricks python_wheel_task.
+
+    Full flow: Download ZIPs from API -> Extract CSVs -> Load to Delta -> Cleanup
+    """
     start_time = time.time()
     config = parse_static_loader_args()
 
@@ -148,21 +209,27 @@ def main() -> None:
     error_msg = None
     files_to_cleanup: list[str] = []
 
-    # Temp extraction directory INSIDE the Volume (accessible by all workers)
+    # Temp extraction directory INSIDE the Volume
     extract_dir = os.path.join(config.static_path, "_tmp_extract")
 
     try:
-        # Find latest ZIP files
+        # ── Step 1: Download ZIPs from Trafiklab API ──
+        logger.info("Step 1: Downloading static GTFS ZIPs from Trafiklab API...")
+        _download_static_zips(config.static_path, region="skane")
+
+        # ── Step 2: Find latest ZIP files ──
         static_zip = _find_latest_zip(config.static_path, "skane_static_")
         extra_zip = _find_latest_zip(config.static_path, "skane_extra_")
 
         if not static_zip:
             raise FileNotFoundError(
-                f"No skane_static_*.zip found in {config.static_path}"
+                f"No skane_static_*.zip found in {config.static_path} "
+                f"(download may have failed)"
             )
         if not extra_zip:
             raise FileNotFoundError(
-                f"No skane_extra_*.zip found in {config.static_path}"
+                f"No skane_extra_*.zip found in {config.static_path} "
+                f"(download may have failed)"
             )
 
         logger.info(f"Static ZIP: {os.path.basename(static_zip)}")
@@ -176,7 +243,8 @@ def main() -> None:
         os.makedirs(extract_dir, exist_ok=True)
         files_to_cleanup.append(extract_dir)
 
-        # Load each table
+        # ── Step 3: Extract and load each table ──
+        logger.info("Step 3: Extracting and loading tables...")
         for table_name, (zip_prefix, csv_name) in STATIC_TABLE_MAP.items():
             zip_path = static_zip if zip_prefix == "skane_static_" else extra_zip
             fq_table = f"{config.catalog}.{config.schema}.{table_name}"
@@ -214,15 +282,14 @@ def main() -> None:
 
     duration = time.time() - start_time
 
-    # Cleanup: delete extracted CSVs AND source ZIPs
+    # ── Step 4: Cleanup ──
     if status == "success" and files_to_cleanup:
-        logger.info("Cleaning up extracted files and source ZIPs...")
+        logger.info("Step 4: Cleaning up extracted files and source ZIPs...")
         _cleanup_files(files_to_cleanup)
     elif status == "failed":
-        # Still clean up the extraction dir on failure, but keep ZIPs
         if os.path.isdir(extract_dir):
             _cleanup_files([extract_dir])
-        logger.info("Kept source ZIPs (load failed — may need retry)")
+        logger.info("Kept source ZIPs (load failed -- may need retry)")
 
     _print_summary(status, duration, results, error_msg)
 
@@ -240,7 +307,6 @@ def main() -> None:
     print(json.dumps(exit_output, indent=2))
     try:
         from pyspark.dbutils import DBUtils
-
         dbutils = DBUtils(spark)
         dbutils.notebook.exit(json.dumps(exit_output))
     except ImportError:
