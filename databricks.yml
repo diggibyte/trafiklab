@@ -9,8 +9,8 @@ variables:
     description: "Volume name for raw data"
     default: trafiklab_raw
   checkpoint_path:
-    description: "Auto Loader checkpoint (exactly-once)"
-    default: "dbfs:/htq2/checkpoints/autoloader"
+    description: "Auto Loader checkpoint on UC Volume (exactly-once)"
+    default: "/Volumes/${var.catalog}/bronze/${var.volume_path}/checkpoints/autoloader"
 
 artifacts:
   htq2_gtfs_wheel:
