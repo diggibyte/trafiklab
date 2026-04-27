@@ -48,8 +48,8 @@ HTTP_TIMEOUT_SECONDS = 30
 METADATA_TABLE = "_pipeline_metadata"
 QUALITY_RESULTS_TABLE = "_quality_results"
 
-# Default Auto Loader checkpoint path (DBFS, persistent across runs)
-DEFAULT_CHECKPOINT_PATH = "dbfs:/htq2/checkpoints/autoloader"
+# Default Auto Loader checkpoint path (UC Volume, persistent across runs)
+DEFAULT_CHECKPOINT_PATH = "/Volumes/htq2_dev/bronze/trafiklab_raw/checkpoints/autoloader"
 
 # ── Table Group Constants (for --tables parameter) ───────────────────
 
@@ -275,7 +275,7 @@ def parse_prep_args(args: Optional[list[str]] = None) -> PrepConfig:
     parser.add_argument("--silver_schema", default="silver", help="Silver schema")
     parser.add_argument("--volume", default="trafiklab_raw", help="Volume name")
     parser.add_argument("--checkpoint_path", default=DEFAULT_CHECKPOINT_PATH,
-                        help="Auto Loader checkpoint path (DBFS)")
+                        help="Auto Loader checkpoint path (UC Volume)")
     parser.add_argument("--region", default=REGION, help="GTFS region")
 
     parsed = parser.parse_args(args or sys.argv[1:])

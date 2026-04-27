@@ -10,7 +10,7 @@ v3.1.1: Auto Loader writes raw binary to staging, parsing in main process.
 Fixes foreachBatch worker process issue on job clusters (Spark Connect).
 
 Usage (via python_wheel_task):
-    htq2_gtfs prep --catalog htq2_dev --checkpoint_path dbfs:/htq2/checkpoints/autoloader
+    htq2_gtfs prep --catalog htq2_dev --checkpoint_path /Volumes/htq2_dev/bronze/trafiklab_raw/checkpoints/autoloader
 """
 
 from __future__ import annotations
