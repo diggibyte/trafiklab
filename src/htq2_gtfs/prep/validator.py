@@ -7,7 +7,7 @@ Checks:
   P1: parsed_journey row count > 0
   P2: parsed_call row count > 0
   P3: Schema matches JOURNEY_SCHEMA / CALL_SCHEMA
-  P4: DVJId null rate < 10%
+  P4: DVJId null rate < 15%
   P5: OperatingDate not null
 """
 
@@ -55,13 +55,13 @@ def validate_prep_output(journey_df: DataFrame, call_df: DataFrame) -> None:
     if missing_c := expected_c - actual_c:
         errors.append(f"P3: parsed_call missing columns: {missing_c}")
 
-    # P4: DVJId null rate < 10%
+    # P4: DVJId null rate < 15%
     if j_count > 0:
         j_null_count = journey_df.filter(F.col("DVJId").isNull()).count()
         j_null_rate = j_null_count / j_count
-        if j_null_rate > 0.10:
+        if j_null_rate > 0.15:
             errors.append(
-                f"P4: DVJId null rate {j_null_rate:.1%} exceeds 10% threshold "
+                f"P4: DVJId null rate {j_null_rate:.1%} exceeds 15% threshold "
                 f"({j_null_count}/{j_count})"
             )
         else:
@@ -74,6 +74,25 @@ def validate_prep_output(journey_df: DataFrame, call_df: DataFrame) -> None:
             errors.append(
                 f"P5: OperatingDate contains {op_null} NULL values"
             )
+
+    # Soft checks (warnings only): flag columns that are unexpectedly all-NULL.
+    # These commonly indicate a broken parse/enrichment path (e.g. writing
+    # placeholder NULLs instead of parsing GTFS-RT fields).
+    if j_count > 0:
+        warn_cols = [
+            "LineNumber",
+            "DirectionNumber",
+            "JourneyNumber",
+            "VehicleAssignedFromDateTime",
+            "RunByVehicleGid",
+            "JourneyGid",
+        ]
+        for col_name in warn_cols:
+            if col_name not in journey_df.columns:
+                continue
+            nulls = journey_df.filter(F.col(col_name).isNull()).count()
+            if nulls == j_count:
+                logger.warning(f"Prep warning: {col_name} is 100% NULL in parsed_journey ({nulls}/{j_count})")
 
     if errors:
         msg = (

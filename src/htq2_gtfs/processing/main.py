@@ -225,17 +225,112 @@ def run_transform(
             vp_df = vp_df.drop("_run_id", "_parsed_timestamp")
             logger.info(f"Loaded VP data from {fq_vp}")
 
+            # Ensure DVJId exists on VP rows (required for JourneyLink_* GPS tables).
+            # In some pipelines, VP parsing produces only trip_id and not the mapped DVJId.
+            if "DVJId" not in vp_df.columns or vp_df.filter(F.col("DVJId").isNotNull()).limit(1).count() == 0:
+                fq_dvj = f"{config.catalog}.{config.bronze_schema}.static_dvj_mapping"
+                if spark.catalog.tableExists(fq_dvj) and "trip_id" in vp_df.columns:
+                    dvj_map = spark.table(fq_dvj).select(
+                        F.col("trip_id").cast("string").alias("_m_trip_id"),
+                        F.col("dated_vehicle_journey_gid").cast("string").alias("_m_dvj_id"),
+                    ).where(F.col("_m_trip_id").isNotNull() & F.col("_m_dvj_id").isNotNull()).dropDuplicates(["_m_trip_id"])
+
+                    vp_df = (
+                        vp_df
+                        .withColumn("_m_trip_id", F.col("trip_id").cast("string"))
+                        .join(dvj_map, "_m_trip_id", "left")
+                        .withColumn("DVJId", F.coalesce(F.col("DVJId"), F.col("_m_dvj_id")).cast("string"))
+                        .drop("_m_trip_id", "_m_dvj_id")
+                    )
+                    logger.info(f"Enriched VP DVJId via {fq_dvj}")
+
     # Build stops_df from static data for GPS tables
     if config.tables in ("gps", "all"):
-        processor.load_static_data(date.today())
-        stops_df = processor._build_stops_df()
+        # Prefer Bronze static stops Delta table when available (common in pipelines
+        # where static GTFS is ingested separately and no GTFS zip is present).
+        fq_stops = f"{config.catalog}.{config.bronze_schema}.static_stops"
+        if spark.catalog.tableExists(fq_stops):
+            raw_stops = spark.table(fq_stops)
+            if prep_run_id and "_run_id" in raw_stops.columns:
+                raw_stops = raw_stops.filter(F.col("_run_id") == prep_run_id)
+            # Normalize to expected schema used by StopPoint builders
+            stops_df = raw_stops.select(
+                F.col("stop_id").cast("string").alias("stop_id"),
+                F.col("stop_name").cast("string").alias("stop_name"),
+                F.col("stop_lat").cast("double").alias("stop_lat"),
+                F.col("stop_lon").cast("double").alias("stop_lon"),
+            )
+            logger.info(f"Loaded stops data from {fq_stops}")
+        else:
+            # Fallback to building from a GTFS zip/static files if present
+            processor.load_static_data(date.today())
+            stops_df = processor._build_stops_df()
 
     # Build static DataFrames for planned path (shapes, trips, stop_times)
     if config.tables in ("base", "all"):
-        shapes_df, trips_df, stop_times_df = processor.build_static_spark_dfs(
-            date.today()
-        )
-        logger.info("Loaded static DataFrames for planned path")
+        # Prefer Bronze static GTFS Delta tables when available (common in pipelines
+        # where GTFS static is ingested separately and no GTFS zip is present).
+        fq_shapes = f"{config.catalog}.{config.bronze_schema}.static_shapes"
+        fq_trips = f"{config.catalog}.{config.bronze_schema}.static_trips"
+        fq_stop_times = f"{config.catalog}.{config.bronze_schema}.static_stop_times"
+
+        if (
+            spark.catalog.tableExists(fq_shapes)
+            and spark.catalog.tableExists(fq_trips)
+            and spark.catalog.tableExists(fq_stop_times)
+        ):
+            raw_shapes = spark.table(fq_shapes)
+            raw_trips = spark.table(fq_trips)
+            raw_stop_times = spark.table(fq_stop_times)
+
+            if prep_run_id:
+                if "_run_id" in raw_shapes.columns:
+                    raw_shapes = raw_shapes.filter(F.col("_run_id") == prep_run_id)
+                if "_run_id" in raw_trips.columns:
+                    raw_trips = raw_trips.filter(F.col("_run_id") == prep_run_id)
+                if "_run_id" in raw_stop_times.columns:
+                    raw_stop_times = raw_stop_times.filter(F.col("_run_id") == prep_run_id)
+
+            shapes_df = raw_shapes.select(
+                F.col("shape_id").cast("string").alias("shape_id"),
+                F.col("shape_pt_lat").cast("double").alias("shape_pt_lat"),
+                F.col("shape_pt_lon").cast("double").alias("shape_pt_lon"),
+                F.col("shape_pt_sequence").cast("int").alias("shape_pt_sequence"),
+                F.col("shape_dist_traveled").cast("double").alias("shape_dist_traveled"),
+            )
+
+            trips_df = raw_trips.select(
+                F.col("route_id").cast("string").alias("route_id"),
+                F.col("service_id").cast("string").alias("service_id"),
+                F.col("trip_id").cast("string").alias("trip_id"),
+                F.col("trip_headsign").cast("string").alias("trip_headsign"),
+                F.col("trip_short_name").cast("string").alias("trip_short_name"),
+                F.col("direction_id").cast("int").alias("direction_id"),
+                F.col("shape_id").cast("string").alias("shape_id"),
+            )
+
+            stop_times_df = raw_stop_times.select(
+                F.col("trip_id").cast("string").alias("trip_id"),
+                F.col("arrival_time").cast("string").alias("arrival_time"),
+                F.col("departure_time").cast("string").alias("departure_time"),
+                F.col("stop_id").cast("string").alias("stop_id"),
+                F.col("stop_sequence").cast("int").alias("stop_sequence"),
+                F.col("stop_headsign").cast("string").alias("stop_headsign"),
+                F.col("pickup_type").cast("int").alias("pickup_type"),
+                F.col("drop_off_type").cast("int").alias("drop_off_type"),
+                F.col("shape_dist_traveled").cast("double").alias("shape_dist_traveled"),
+                F.col("timepoint").cast("int").alias("timepoint"),
+            )
+
+            logger.info(
+                f"Loaded static DataFrames for planned path from Bronze tables: "
+                f"{fq_shapes}, {fq_trips}, {fq_stop_times}"
+            )
+        else:
+            shapes_df, trips_df, stop_times_df = processor.build_static_spark_dfs(
+                date.today()
+            )
+            logger.info("Loaded static DataFrames for planned path (zip/static files)")
 
     # Step 4: Build tables based on --tables parameter
     builder = ViewBuilder(spark)

@@ -1,4 +1,4 @@
-name: CI-CD Pipeline
+﻿name: CI-CD Pipeline
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 on:
@@ -37,18 +37,16 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     environment: production
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.SP_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Databricks CLI
         run: |
           curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
-      - name: Validate bundle
-        run: databricks bundle validate --target dev
-        env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      - name: Validate bundle 
+        run: databricks bundle validate --target prod
       - name: Deploy bundle
         run: databricks bundle deploy --target prod
-        env:
-          DATABRICKS_HOST: ${{ secrets.PROD_DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.PROD_DATABRICKS_TOKEN }}

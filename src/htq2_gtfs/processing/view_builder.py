@@ -930,22 +930,50 @@ class ViewBuilder:
                 F.col("s1.OperatingDate").alias("OperatingDate"),
                 F.col("s1.SequenceNumber").alias("FromSeq"),
                 F.col("s2.SequenceNumber").alias("EndOfLinkSequenceNumber"),
-                F.col("s1.ObservedDepartureDateTime").alias("LinkStartTime"),
-                F.col("s2.ObservedArrivalDateTime").alias("LinkEndTime"),
+                # Observed*DateTime is stored as ISO-8601 strings (often with timezone offset).
+                # NOTE: In ANSI mode, `to_timestamp` throws on parse failures (it does not return NULL),
+                # which can fail the whole workload. Use `try_to_timestamp` to tolerate bad rows.
+                F.coalesce(
+                    F.try_to_timestamp(F.col("s1.ObservedDepartureDateTime"), F.lit("yyyy-MM-dd'T'HH:mm:ss.SSSXXX")),
+                    F.try_to_timestamp(F.col("s1.ObservedDepartureDateTime"), F.lit("yyyy-MM-dd'T'HH:mm:ssXXX")),
+                    F.try_to_timestamp(F.col("s1.ObservedDepartureDateTime")),
+                ).alias("LinkStartTime"),
+                F.coalesce(
+                    F.try_to_timestamp(F.col("s2.ObservedArrivalDateTime"), F.lit("yyyy-MM-dd'T'HH:mm:ss.SSSXXX")),
+                    F.try_to_timestamp(F.col("s2.ObservedArrivalDateTime"), F.lit("yyyy-MM-dd'T'HH:mm:ssXXX")),
+                    F.try_to_timestamp(F.col("s2.ObservedArrivalDateTime")),
+                ).alias("LinkEndTime"),
             )
         )
 
-        vp_with_ts = vp_matched.withColumn(
-            "pos_ts",
-            F.from_unixtime("timestamp").cast("string")
+        vp_with_ts = (
+            vp_matched
+            .withColumn(
+                "pos_ts",
+                F.coalesce(
+                    # VehiclePosition timestamps can be either epoch seconds or epoch milliseconds.
+                    # Spark's `from_unixtime` expects seconds, so normalize ms -> s.
+                    F.from_unixtime(
+                        F.when(
+                            F.col("timestamp").cast("double") >= F.lit(100000000000.0),
+                            F.col("timestamp").cast("double") / F.lit(1000.0),
+                        ).otherwise(F.col("timestamp").cast("double")).cast("long")
+                    ).cast("timestamp"),
+                    # Fallback: tolerate ISO-8601 timestamp strings (and invalid rows) without failing the job.
+                    F.try_to_timestamp(F.col("timestamp").cast("string")),
+                ),
+            )
         )
 
         link_gps = (
             vp_with_ts.alias("v")
             .join(links.alias("l"), on=[F.col("v.DVJId") == F.col("l.DVJId")], how="inner")
             .filter(
-                (F.col("v.pos_ts") >= F.col("l.LinkStartTime")) &
-                (F.col("v.pos_ts") <= F.col("l.LinkEndTime"))
+                F.col("v.pos_ts").isNotNull()
+                & F.col("l.LinkStartTime").isNotNull()
+                & F.col("l.LinkEndTime").isNotNull()
+                & (F.col("v.pos_ts") >= F.col("l.LinkStartTime"))
+                & (F.col("v.pos_ts") <= F.col("l.LinkEndTime"))
             )
             .select(
                 F.col("v.DVJId").alias("DVJId"),
@@ -1100,9 +1128,42 @@ class ViewBuilder:
         R = 6371000
         MATCHING_RADIUS = 200
 
+        # Avoid a full crossJoin(VP, stops) which can be extremely expensive.
+        # Use coarse bucketing (grid) to prefilter candidates, then compute the
+        # exact haversine distance and keep < MATCHING_RADIUS.
+        #
+        # 0.002 degrees ~ 222m latitude. Longitude varies with latitude, but
+        # we refine with haversine anyway.
+        BUCKET_DEG = 0.002
+
+        v = (
+            vp_valid
+            .alias("v")
+            .withColumn("_lat_b", F.floor(F.col("latitude") / F.lit(BUCKET_DEG)).cast("long"))
+            .withColumn("_lon_b", F.floor(F.col("longitude") / F.lit(BUCKET_DEG)).cast("long"))
+        )
+
+        s0 = (
+            stops_df
+            .alias("s")
+            .filter(F.col("stop_lat").isNotNull() & F.col("stop_lon").isNotNull())
+            .withColumn("_lat_b", F.floor(F.col("stop_lat") / F.lit(BUCKET_DEG)).cast("long"))
+            .withColumn("_lon_b", F.floor(F.col("stop_lon") / F.lit(BUCKET_DEG)).cast("long"))
+        )
+
+        # Expand stop buckets to 3x3 neighborhood to catch boundary cases.
+        s = (
+            s0
+            .withColumn("_lat_b", F.explode(F.array(
+                F.col("_lat_b") - F.lit(1), F.col("_lat_b"), F.col("_lat_b") + F.lit(1)
+            )))
+            .withColumn("_lon_b", F.explode(F.array(
+                F.col("_lon_b") - F.lit(1), F.col("_lon_b"), F.col("_lon_b") + F.lit(1)
+            )))
+        )
+
         matched = (
-            vp_valid.alias("v")
-            .crossJoin(stops_df.alias("s"))
+            v.join(s, on=["_lat_b", "_lon_b"], how="inner")
             .withColumn("dlat", F.radians(F.col("v.latitude") - F.col("s.stop_lat")))
             .withColumn("dlon", F.radians(F.col("v.longitude") - F.col("s.stop_lon")))
             .withColumn("lat1_rad", F.radians(F.col("v.latitude")))
@@ -1115,6 +1176,7 @@ class ViewBuilder:
             )
             .withColumn("distance_m", F.lit(2 * R) * F.asin(F.sqrt(F.col("a"))))
             .filter(F.col("distance_m") < MATCHING_RADIUS)
+            .drop("_lat_b", "_lon_b")
         )
 
         if matched.isEmpty():

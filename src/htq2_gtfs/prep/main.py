@@ -6,11 +6,11 @@ Layer 2 in the pipeline architecture. Responsibilities:
 3. Inline validation (fail-fast before Silver)
 4. APPEND to durable staging tables: bronze.parsed_journey, bronze.parsed_call
 
-v3.1.1: Auto Loader writes raw binary to staging, parsing in main process.
+v3.1.8: Auto Loader writes raw binary to staging, parsing in main process.
 Fixes foreachBatch worker process issue on job clusters (Spark Connect).
 
 Usage (via python_wheel_task):
-    htq2_gtfs prep --catalog htq2_dev --checkpoint_path /Volumes/htq2_dev/bronze/trafiklab_raw/checkpoints/autoloader
+    htq2_gtfs prep --catalog htq2_dev --checkpoint_path dbfs:/htq2/checkpoints/autoloader
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -28,6 +28,7 @@ from pyspark.sql import types as T
 
 from htq2_gtfs.config import parse_prep_args, PrepConfig, METADATA_TABLE
 from htq2_gtfs.helpers.logging_config import get_logger
+from htq2_gtfs.helpers.file_utils import FILENAME_TS_PATTERN
 from htq2_gtfs.processing.core import GTFSProcessor, JOURNEY_SCHEMA, CALL_SCHEMA, VP_SCHEMA
 from htq2_gtfs.prep.validator import validate_prep_output
 
@@ -122,9 +123,13 @@ def _parse_raw_files(
     raw_files = spark.table(fq_raw).filter(F.col("_run_id") == run_id).collect()
 
     stats = {"files": len(raw_files), "journeys": 0, "calls": 0, "vp": 0, "errors": 0}
-    journey_rows = []
-    call_rows = []
-    vp_rows = []
+    journey_rows: list[tuple] = []
+    call_rows: list[tuple] = []
+    vp_rows: list[tuple] = []
+
+    # Group raw files into timestamped sets so we can apply cross-feed enrichment.
+    # Filenames normally look like: 2025-04-16T08-30-00Z-skane-TripUpdates.pb
+    groups: dict[str, dict[str, Any]] = {}
 
     for row in raw_files:
         content = bytes(row["content"])
@@ -133,93 +138,104 @@ def _parse_raw_files(
         try:
             feed = gtfs_realtime_pb2.FeedMessage()
             feed.ParseFromString(content)
-            snapshot_ts = datetime.utcfromtimestamp(feed.header.timestamp)
-            operating_date = snapshot_ts.strftime("%Y%m%d")
-            operating_weekday = snapshot_ts.strftime("%A")[:3]
+        except Exception as e:
+            stats["errors"] += 1
+            logger.error(f"Error parsing protobuf {filename}: {e}")
+            continue
 
+        match = FILENAME_TS_PATTERN.match(filename)
+        if match:
+            ts_key, _region, feed_name = match.groups()
+            if feed_name == "SeviceAlerts.pb":
+                feed_name = "ServiceAlerts.pb"
+        else:
+            # Fallback: group by header timestamp (best-effort)
+            header_ts = int(feed.header.timestamp) if feed.header.timestamp else 0
+            ts_key = (
+                datetime.utcfromtimestamp(header_ts).strftime("%Y-%m-%dT%H-%M-%SZ")
+                if header_ts
+                else "unknown"
+            )
             if "TripUpdates" in filename:
-                for entity in feed.entity:
-                    tu = entity.trip_update
-                    trip_id = tu.trip.trip_id
-                    dvj_id = processor._dvj_mapping.get(trip_id, trip_id)
-                    enr = processor._trip_enrichment.get(trip_id, {})
-
-                    journey_rows.append((
-                        dvj_id, operating_date, operating_weekday,
-                        enr.get("TripShortName"), enr.get("LineNumber"),
-                        enr.get("DirectionNumber"), None,
-                        enr.get("JourneyStartTime"), enr.get("DestinationName"),
-                        None, None, None, None,
-                        enr.get("ExtendedLineDesignation"),
-                        enr.get("JourneyOriginName"), enr.get("JourneyEndStopName"),
-                        enr.get("BlockNumber"), None, None, None, None, None,
-                        None, None,
-                        len(tu.stop_time_update) if tu.stop_time_update else None,
-                        None, None, None,
-                        tu.trip.schedule_relationship == 3,
-                        snapshot_ts.isoformat(),
-                        run_id, datetime.now(timezone.utc),
-                    ))
-
-                    for seq, stu in enumerate(tu.stop_time_update, 1):
-                        si = processor._stop_lookup.get(stu.stop_id, {})
-                        arr_d = stu.arrival.delay if stu.HasField("arrival") else None
-                        dep_d = stu.departure.delay if stu.HasField("departure") else None
-
-                        call_rows.append((
-                            dvj_id, operating_date, operating_weekday,
-                            seq, stu.stop_id, si.get("stop_name"),
-                            enr.get("TripShortName"), enr.get("LineNumber"),
-                            enr.get("DirectionNumber"),
-                            arr_d, None, dep_d, None,
-                            None, None,
-                            enr.get("ExtendedLineDesignation"),
-                            enr.get("JourneyStartTime"), None,
-                            enr.get("JourneyOriginName"), enr.get("JourneyEndStopName"),
-                            None, enr.get("BlockNumber"), None, None,
-                            enr.get("DestinationName"), None, None, None,
-                            None, None, None, None,
-                            len(tu.stop_time_update) if tu.stop_time_update else None,
-                            None, None, None,
-                            None, None,
-                            None, None, None,
-                            None, None, None,
-                            None, None,
-                            None, None,
-                            None, None,
-                            None, None,
-                            None, None,
-                            si.get("stop_lat"), si.get("stop_lon"),
-                            None, None,
-                            None, None, None,
-                            snapshot_ts.isoformat(),
-                            run_id, datetime.now(timezone.utc),
-                        ))
-
+                feed_name = "TripUpdates.pb"
             elif "VehiclePositions" in filename:
-                for entity in feed.entity:
-                    vp = entity.vehicle
-                    tid = vp.trip.trip_id if vp.HasField("trip") else None
-                    did = processor._dvj_mapping.get(tid, tid) if tid else None
+                feed_name = "VehiclePositions.pb"
+            elif "ServiceAlerts" in filename or "SeviceAlerts" in filename:
+                feed_name = "ServiceAlerts.pb"
+            else:
+                feed_name = "unknown.pb"
 
-                    vp_rows.append((
-                        did, tid,
-                        vp.vehicle.id if vp.HasField("vehicle") else None,
-                        vp.position.latitude if vp.HasField("position") else None,
-                        vp.position.longitude if vp.HasField("position") else None,
-                        vp.position.bearing if vp.HasField("position") and vp.position.bearing else None,
-                        vp.position.speed if vp.HasField("position") and vp.position.speed else None,
-                        vp.timestamp if vp.timestamp else None,
-                        operating_date,
-                        run_id, datetime.now(timezone.utc),
-                    ))
+        groups.setdefault(ts_key, {})[feed_name] = feed
 
-            elif "ServiceAlerts" in filename:
-                logger.debug(f"ServiceAlerts: {len(feed.entity)} entities in {filename}")
+    parsed_ts = datetime.now(timezone.utc)
+
+    # Parse and enrich per timestamp group
+    for ts_key in sorted(groups.keys()):
+        feeds = groups[ts_key]
+        journeys: list[dict] = []
+        calls: list[dict] = []
+
+        snapshot_ts = None
+        # Prefer TripUpdates header timestamp for fallback OperatingDate
+        header_feed = feeds.get("TripUpdates.pb") or feeds.get("VehiclePositions.pb") or feeds.get("ServiceAlerts.pb")
+        if header_feed and getattr(header_feed, "header", None) and header_feed.header.timestamp:
+            snapshot_ts = datetime.utcfromtimestamp(int(header_feed.header.timestamp))
+        operating_date = snapshot_ts.strftime("%Y-%m-%d") if snapshot_ts else None
+        operating_weekday = snapshot_ts.strftime("%A") if snapshot_ts else None
+        snapshot_dt_str = snapshot_ts.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if snapshot_ts else None
+
+        try:
+            tu_feed = feeds.get("TripUpdates.pb")
+            if tu_feed:
+                j, c = processor._parse_trip_updates(tu_feed, ts_key)
+                journeys.extend(j)
+                calls.extend(c)
+
+            vp_feed = feeds.get("VehiclePositions.pb")
+            if vp_feed:
+                # Enrich journey/call objects in-place
+                processor._enrich_from_vehicle_positions(vp_feed, journeys, calls)
+                # Also stage raw VP rows for Phase 2 GPS tables
+                for vp in processor._extract_vehicle_positions(vp_feed):
+                    row_vals = [vp.get(f.name) for f in VP_SCHEMA.fields]
+                    vp_rows.append(tuple(row_vals + [run_id, parsed_ts]))
+
+            sa_feed = feeds.get("ServiceAlerts.pb")
+            if sa_feed and journeys:
+                processor._enrich_from_service_alerts(sa_feed, journeys, calls)
+
+            # Backfill OperatingDate/WeekDay + assignment timestamps when absent
+            for j in journeys:
+                if operating_date and not j.get("OperatingDate"):
+                    j["OperatingDate"] = operating_date
+                if operating_weekday and not j.get("OperatingWeekDay"):
+                    j["OperatingWeekDay"] = operating_weekday
+                if snapshot_dt_str and not j.get("VehicleAssignedFromDateTime"):
+                    j["VehicleAssignedFromDateTime"] = snapshot_dt_str
+                    j["VehicleAssignedUptoDateTime"] = snapshot_dt_str
+
+            for c in calls:
+                if operating_date and not c.get("OperatingDate"):
+                    c["OperatingDate"] = operating_date
+                if operating_weekday and not c.get("OperatingWeekDay"):
+                    c["OperatingWeekDay"] = operating_weekday
+                if snapshot_dt_str and not c.get("VehicleAssignedFromDateTime"):
+                    c["VehicleAssignedFromDateTime"] = snapshot_dt_str
+                    c["VehicleAssignedUptoDateTime"] = snapshot_dt_str
+
+            for j in journeys:
+                norm = processor._normalize_journey(j)
+                row_vals = [norm.get(f.name) for f in JOURNEY_SCHEMA.fields]
+                journey_rows.append(tuple(row_vals + [run_id, parsed_ts]))
+
+            for c in calls:
+                norm = processor._normalize_call(c)
+                row_vals = [norm.get(f.name) for f in CALL_SCHEMA.fields]
+                call_rows.append(tuple(row_vals + [run_id, parsed_ts]))
 
         except Exception as e:
             stats["errors"] += 1
-            logger.error(f"Error parsing {filename}: {e}")
+            logger.error(f"Error parsing grouped feeds {ts_key}: {e}", exc_info=True)
 
     # Write to staging tables
     if journey_rows:
@@ -328,7 +344,7 @@ def main() -> None:
 
     # Print summary
     print("\n" + "=" * 70)
-    print("  HTQ2 PREP (Auto Loader) v3.1.1")
+    print("  HTQ2 PREP (Auto Loader) v3.1.8")
     print("=" * 70)
     print(f"  Run ID:       {run_id}")
     print(f"  Status:       {status.upper()}")

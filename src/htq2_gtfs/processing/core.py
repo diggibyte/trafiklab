@@ -18,6 +18,7 @@ from typing import Any, Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from pyspark.sql.window import Window
 
 from htq2_gtfs.config import TransformConfig
 from htq2_gtfs.helpers.file_utils import RealtimeFileSet, find_best_static_file
@@ -181,10 +182,62 @@ class GTFSProcessor:
     def load_static_data(self, target_date: date) -> None:
         """Load static GTFS data (stops, routes, DVJId mapping).
 
-        Reads from ZIP files in the Volume. The DVJId mapping from
-        trips_dated_vehicle_journey.txt is loaded into a Python dict
-        for fast O(1) lookups during protobuf parsing.
+        Preferred source: bronze Delta tables produced by the static loader
+        job (static_routes/static_trips/static_stops/static_stop_times/
+        static_shapes/static_dvj_mapping).
+
+        Fallback source: ZIP files in the Volume.
+
+        The DVJId mapping is loaded into a Python dict for fast O(1)
+        lookups during protobuf parsing.
         """
+        bronze_schema = getattr(self.config, "bronze_schema", "bronze")
+        catalog = self.config.catalog
+
+        fq_trips = f"{catalog}.{bronze_schema}.static_trips"
+        fq_routes = f"{catalog}.{bronze_schema}.static_routes"
+        fq_stops = f"{catalog}.{bronze_schema}.static_stops"
+        fq_stop_times = f"{catalog}.{bronze_schema}.static_stop_times"
+        fq_dvj = f"{catalog}.{bronze_schema}.static_dvj_mapping"
+
+        have_static_tables = all(
+            self.spark.catalog.tableExists(t)
+            for t in [fq_trips, fq_routes, fq_stops, fq_stop_times]
+        )
+        have_dvj_table = self.spark.catalog.tableExists(fq_dvj)
+
+        if have_static_tables:
+            try:
+                self._build_enrichment_lookups_from_tables(
+                    routes_df=self.spark.table(fq_routes),
+                    trips_df=self.spark.table(fq_trips),
+                    stops_df=self.spark.table(fq_stops),
+                    stop_times_df=self.spark.table(fq_stop_times),
+                )
+                logger.info(
+                    f"Loaded static enrichment from bronze tables: {fq_trips}, {fq_routes}, {fq_stops}, {fq_stop_times}"
+                )
+            except Exception as e:
+                self._trip_enrichment = {}
+                self._stop_lookup = {}
+                logger.warning(f"Failed to load static enrichment from bronze tables: {e}", exc_info=True)
+
+            if have_dvj_table:
+                try:
+                    self._dvj_mapping = self._load_dvj_mapping_from_table(self.spark.table(fq_dvj))
+                    logger.info(
+                        f"Loaded DVJId mapping from bronze table {fq_dvj}: {len(self._dvj_mapping):,} entries",
+                        extra={"row_count": len(self._dvj_mapping)},
+                    )
+                except Exception as e:
+                    self._dvj_mapping = {}
+                    logger.warning(f"Failed to load DVJId mapping from bronze table {fq_dvj}: {e}", exc_info=True)
+            else:
+                self._dvj_mapping = {}
+                logger.warning(f"Bronze DVJ mapping table missing: {fq_dvj}")
+
+            return
+
         static_path = self.config.static_path
 
         # Load main static ZIP
@@ -229,6 +282,157 @@ class GTFSProcessor:
         return result
 
 
+    def _build_enrichment_lookups_from_tables(
+        self,
+        routes_df: DataFrame,
+        trips_df: DataFrame,
+        stops_df: DataFrame,
+        stop_times_df: DataFrame,
+    ) -> None:
+        """Build static enrichment lookups from bronze static Delta tables."""
+        self._trip_enrichment = {}
+        self._stop_lookup = {}
+
+        for r in (
+            stops_df.select(
+                F.col("stop_id").cast("string").alias("stop_id"),
+                F.col("stop_name").cast("string").alias("stop_name"),
+                F.col("stop_lat").cast("double").alias("stop_lat"),
+                F.col("stop_lon").cast("double").alias("stop_lon"),
+            )
+            .where(F.col("stop_id").isNotNull())
+            .dropDuplicates(["stop_id"])
+            .collect()
+        ):
+            self._stop_lookup[r["stop_id"]] = {
+                "stop_name": r["stop_name"] or "",
+                "stop_lat": float(r["stop_lat"]) if r["stop_lat"] is not None else None,
+                "stop_lon": float(r["stop_lon"]) if r["stop_lon"] is not None else None,
+            }
+
+        route_rows = (
+            routes_df.select(
+                F.col("route_id").cast("string").alias("route_id"),
+                F.col("route_short_name").cast("string").alias("route_short_name"),
+                F.col("route_long_name").cast("string").alias("route_long_name"),
+            )
+            .where(F.col("route_id").isNotNull())
+            .dropDuplicates(["route_id"])
+            .collect()
+        )
+        route_short = {r["route_id"]: (r["route_short_name"] or None) for r in route_rows}
+        route_long = {r["route_id"]: (r["route_long_name"] or None) for r in route_rows}
+
+        st = (
+            stop_times_df.select(
+                F.col("trip_id").cast("string").alias("trip_id"),
+                F.col("stop_id").cast("string").alias("stop_id"),
+                F.col("stop_sequence").cast("int").alias("stop_sequence"),
+                F.col("departure_time").cast("string").alias("departure_time"),
+                F.col("arrival_time").cast("string").alias("arrival_time"),
+            )
+            .where(F.col("trip_id").isNotNull() & F.col("stop_sequence").isNotNull())
+        )
+
+        w_asc = Window.partitionBy("trip_id").orderBy(F.col("stop_sequence").asc())
+        w_desc = Window.partitionBy("trip_id").orderBy(F.col("stop_sequence").desc())
+
+        first_stop = (
+            st.withColumn("_rn", F.row_number().over(w_asc))
+            .where(F.col("_rn") == 1)
+            .select(
+                "trip_id",
+                F.col("stop_id").alias("origin_stop_id"),
+                F.coalesce(F.col("departure_time"), F.col("arrival_time")).alias("first_departure_time"),
+            )
+        )
+        last_stop = (
+            st.withColumn("_rn", F.row_number().over(w_desc))
+            .where(F.col("_rn") == 1)
+            .select("trip_id", F.col("stop_id").alias("end_stop_id"))
+        )
+
+        trip_stops = (
+            first_stop.join(last_stop, "trip_id", "left")
+            .join(
+                stops_df.select(
+                    F.col("stop_id").cast("string").alias("origin_stop_id"),
+                    F.col("stop_name").cast("string").alias("origin_stop_name"),
+                ).dropDuplicates(["origin_stop_id"]),
+                "origin_stop_id",
+                "left",
+            )
+            .join(
+                stops_df.select(
+                    F.col("stop_id").cast("string").alias("end_stop_id"),
+                    F.col("stop_name").cast("string").alias("end_stop_name"),
+                ).dropDuplicates(["end_stop_id"]),
+                "end_stop_id",
+                "left",
+            )
+            .select("trip_id", "first_departure_time", "origin_stop_name", "end_stop_name")
+        )
+
+        # Select available columns from trips_df (block_id may not exist in all GTFS feeds)
+        trip_cols = [
+            F.col("trip_id").cast("string").alias("trip_id"),
+            F.col("route_id").cast("string").alias("route_id"),
+            F.col("direction_id").cast("string").alias("direction_id"),
+            F.col("trip_headsign").cast("string").alias("trip_headsign"),
+            (F.col("block_id").cast("string") if "block_id" in trips_df.columns else F.lit(None).cast("string")).alias("block_id"),
+            F.col("trip_short_name").cast("string").alias("trip_short_name"),
+        ]
+        enriched = (
+            trips_df.select(*trip_cols)
+            .where(F.col("trip_id").isNotNull())
+            .join(trip_stops, "trip_id", "left")
+        )
+
+        for r in enriched.collect():
+            trip_id = r["trip_id"]
+            route_id = r["route_id"]
+            direction_id_str = r["direction_id"] or ""
+            headsign = r["trip_headsign"] or ""
+            block_id = r["block_id"] or ""
+            trip_short_name = r["trip_short_name"] or ""
+
+            origin_name = r["origin_stop_name"] or None
+            end_name = r["end_stop_name"] or None
+
+            self._trip_enrichment[trip_id] = {
+                "LineNumber": route_short.get(route_id),
+                "DirectionNumber": (int(direction_id_str) if direction_id_str.isdigit() else None),
+                "JourneyStartTime": r["first_departure_time"] or None,
+                "DestinationName": headsign if headsign else None,
+                "route_id": route_id,
+                "ExtendedLineDesignation": route_long.get(route_id) or None,
+                "BlockNumber": block_id if block_id else None,
+                "TripShortName": trip_short_name if trip_short_name else None,
+                "JourneyOriginName": origin_name,
+                "JourneyEndStopName": end_name or (headsign if headsign else None),
+            }
+
+        logger.info(
+            f"Built static enrichment lookups from bronze tables: {len(self._trip_enrichment):,} trips, "
+            f"{len(route_short):,} routes, {len(self._stop_lookup):,} stops",
+            extra={"enrichment_trips": len(self._trip_enrichment)},
+        )
+
+
+    def _load_dvj_mapping_from_table(self, dvj_df: DataFrame) -> dict[str, str]:
+        """Load DVJ mapping from bronze table static_dvj_mapping."""
+        mapping: dict[str, str] = {}
+        df = dvj_df.select(
+            F.col("trip_id").cast("string").alias("trip_id"),
+            F.col("dated_vehicle_journey_gid").cast("string").alias("dated_vehicle_journey_gid"),
+        ).where(F.col("trip_id").isNotNull() & F.col("dated_vehicle_journey_gid").isNotNull())
+
+        for row in df.toLocalIterator():
+            mapping[row["trip_id"]] = row["dated_vehicle_journey_gid"]
+
+        return mapping
+
+
     def _build_enrichment_lookups(self) -> None:
         """Build trip_id → enrichment lookups from static GTFS data.
 
@@ -270,10 +474,15 @@ class GTFSProcessor:
         for row in self._static_data.get("stops.txt", []):
             stop_id = row.get("stop_id", "").strip()
             if stop_id:
+                try:
+                    lat = float(row.get("stop_lat") or 0)
+                    lon = float(row.get("stop_lon") or 0)
+                except (ValueError, TypeError):
+                    lat, lon = 0.0, 0.0
                 self._stop_lookup[stop_id] = {
                     "stop_name": row.get("stop_name", ""),
-                    "stop_lat": row.get("stop_lat"),
-                    "stop_lon": row.get("stop_lon"),
+                    "stop_lat": lat if lat != 0.0 else None,
+                    "stop_lon": lon if lon != 0.0 else None,
                 }
 
         # Build trip_id → list of stop_ids (ordered by stop_sequence) for origin/end
@@ -322,7 +531,7 @@ class GTFSProcessor:
                 "DestinationName": headsign if headsign else None,
                 # New enrichment fields
                 "route_id": route_id,
-                "ExtendedLineDesignation": route_long_name_lookup.get(route_id, ""),
+                "ExtendedLineDesignation": route_long_name_lookup.get(route_id) or None,
                 "BlockNumber": block_id if block_id else None,
                 "TripShortName": trip_short_name if trip_short_name else None,
                 "JourneyOriginName": origin_name,
@@ -639,10 +848,15 @@ class GTFSProcessor:
 
             tu = entity.trip_update
             trip = tu.trip
-            trip_id = trip.trip_id
+            trip_id = trip.trip_id if trip.trip_id else None
 
-            # Resolve DVJId from static mapping
-            dvj_id = self._dvj_mapping.get(trip_id) if self._dvj_mapping else None
+            # Resolve DVJId from static mapping (trips_dated_vehicle_journey.txt).
+            # This mapping is expected to exist via the daily static "extra" ZIP.
+            dvj_id = (
+                (self._dvj_mapping.get(trip_id) if self._dvj_mapping else None)
+                if trip_id
+                else None
+            )
 
             # Static enrichment fallback for fields missing from GTFS-RT
             enrich = self._trip_enrichment.get(trip_id, {}) if self._trip_enrichment else {}
@@ -663,8 +877,9 @@ class GTFSProcessor:
             route_id = trip.route_id if trip.route_id else enrich.get("route_id")
             line_number = trip.route_id if trip.route_id else enrich.get("LineNumber")
             direction_number = (
-                trip.direction_id if trip.HasField("direction_id")
-                else enrich.get("DirectionNumber")
+                enrich.get("DirectionNumber")
+                if enrich.get("DirectionNumber") is not None
+                else (trip.direction_id if trip.direction_id is not None else None)
             )
             vehicle_label = tu.vehicle.label if tu.vehicle.HasField("label") else None
             vehicle_gid = tu.vehicle.id if tu.vehicle.HasField("id") else None
@@ -685,12 +900,24 @@ class GTFSProcessor:
 
             num_stops = len(tu.stop_time_update)
 
+            # JourneyNumber: prefer static trip_short_name, fallback to trip_id.
+            # Note: VP + ServiceAlerts matching uses GTFS-RT trip_id; store that
+            # in JourneyGid so enrichment can reliably join even when a public
+            # short-name is present (or absent).
+            journey_number = enrich.get("TripShortName") or trip_id
+
+            journey_gid = trip_id or dvj_id
+            reinforced_dvj_id = trip_id or dvj_id
+            uses_jpp_id = f"1{journey_gid}" if journey_gid else None
+            # ExtendedLineDesignation: use None when blank, not empty string
+            extended_line = enrich.get("ExtendedLineDesignation") or None
+
             # Build journey record
             journey = {
                 "DVJId": dvj_id,
-                "OperatingDate": op_date_raw,
+                "OperatingDate": op_date_fmt or op_date_raw,
                 "OperatingWeekDay": op_weekday,
-                "JourneyNumber": trip_id,
+                "JourneyNumber": journey_number,
                 "LineNumber": line_number,
                 "DirectionNumber": direction_number,
                 "VehicleNumber": vehicle_id,
@@ -699,7 +926,7 @@ class GTFSProcessor:
                 "MonitoredYesNo": "Yes",
                 "RunByVehicleGid": vehicle_gid,
                 # New enrichment fields
-                "ExtendedLineDesignation": enrich.get("ExtendedLineDesignation"),
+                "ExtendedLineDesignation": extended_line,
                 "JourneyOriginName": enrich.get("JourneyOriginName"),
                 "JourneyEndStopName": enrich.get("JourneyEndStopName"),
                 "BlockNumber": enrich.get("BlockNumber"),
@@ -711,9 +938,9 @@ class GTFSProcessor:
                 "AssignedDriverGid": vehicle_gid,
                 "JourneyStartDateTime": journey_start_datetime,
                 "JourneyLastStopSequenceNumber": num_stops,
-                "ReinforcedDVJId": trip_id,
-                "UsesJourneyPatternId": f"1{trip_id}" if trip_id else None,
-                "JourneyGid": trip_id,
+                "ReinforcedDVJId": reinforced_dvj_id,
+                "UsesJourneyPatternId": uses_jpp_id,
+                "JourneyGid": journey_gid,
                 "_is_cancelled": False,
                 "_source_timestamp": timestamp,
             }
@@ -726,15 +953,8 @@ class GTFSProcessor:
                 stop_seq = stu.stop_sequence if stu.stop_sequence else idx
                 # Enrich from stops.txt
                 stop_info = self._stop_lookup.get(stop_id, {}) if stop_id else {}
-                coord_lat = None
-                coord_lon = None
-                try:
-                    if stop_info.get("stop_lat"):
-                        coord_lat = float(stop_info["stop_lat"])
-                    if stop_info.get("stop_lon"):
-                        coord_lon = float(stop_info["stop_lon"])
-                except (ValueError, TypeError):
-                    pass
+                coord_lat = stop_info.get("stop_lat")   # already float or None
+                coord_lon = stop_info.get("stop_lon")   # already float or None
 
                 # Observed/timetabled times
                 obs_arr_dt = None
@@ -786,12 +1006,12 @@ class GTFSProcessor:
 
                 call = {
                     "DVJId": dvj_id,
-                    "OperatingDate": op_date_raw,
+                    "OperatingDate": op_date_fmt or op_date_raw,
                     "OperatingWeekDay": op_weekday,
                     "SequenceNumber": stop_seq,
                     "StopAreaNumber": stop_id,
                     "StopName": stop_info.get("stop_name") or None,
-                    "JourneyNumber": trip_id,
+                    "JourneyNumber": journey_number,
                     "LineNumber": line_number,
                     "DirectionNumber": direction_number,
                     "ArrivalDelaySeconds": arr_delay,
@@ -801,7 +1021,7 @@ class GTFSProcessor:
                     # Journey-level propagation
                     "DefaultTransportModeCode": "BUS",
                     "TransportAuthorityNumber": 12,
-                    "ExtendedLineDesignation": enrich.get("ExtendedLineDesignation"),
+                    "ExtendedLineDesignation": extended_line,
                     "JourneyStartTime": start_time,
                     "DatedJourneyStateName": "IN_PROGRESS",
                     "JourneyOriginName": enrich.get("JourneyOriginName"),
@@ -819,9 +1039,9 @@ class GTFSProcessor:
                     "AssignedDriverGid": vehicle_gid,
                     "JourneyStartDateTime": journey_start_datetime,
                     "JourneyLastStopSequenceNumber": num_stops,
-                    "ReinforcedDVJId": trip_id,
-                    "UsesJourneyPatternId": f"1{trip_id}" if trip_id else None,
-                    "JourneyGid": trip_id,
+                    "ReinforcedDVJId": reinforced_dvj_id,
+                    "UsesJourneyPatternId": uses_jpp_id,
+                    "JourneyGid": journey_gid,
                     # Call-specific enrichment
                     "MunicipalityName": "Skåne",
                     "TimingPointYesNo": 0,
@@ -864,30 +1084,143 @@ class GTFSProcessor:
         journeys: list[dict],
         calls: list[dict],
     ) -> None:
-        """Enrich journey/call data with GPS coordinates and vehicle info."""
-        # Build a trip_id -> vehicle position lookup
+        """Enrich journey/call data with GPS coordinates and vehicle info.
+
+        Computes MIN/MAX vp.timestamp per trip_id for InProgress and
+        VehicleAssigned datetime fields, matching the Synapse spec.
+        """
+        # Build lookups from the VehiclePositions feed.
+        #
+        # NOTE: Some producers omit TripDescriptor.trip_id in TripUpdates but
+        # include it in VehiclePositions. When that happens JourneyGid can be
+        # backfilled by matching on vehicle id/label within the same snapshot.
+        #
+        # Accumulate min/max timestamps across all VP entities for each trip.
         vp_lookup: dict[str, dict] = {}
+        vp_ts_min: dict[str, int] = {}
+        vp_ts_max: dict[str, int] = {}
+        vehicle_to_trip: dict[str, str] = {}
+
         for entity in feed.entity:
             if not entity.HasField("vehicle"):
                 continue
             vp = entity.vehicle
             trip_id = vp.trip.trip_id if vp.trip.trip_id else None
-            if trip_id:
-                vp_lookup[trip_id] = {
-                    "Coord_Latitude": vp.position.latitude if vp.HasField("position") else None,
-                    "Coord_Longitude": vp.position.longitude if vp.HasField("position") else None,
-                    "VehicleNumber": vp.vehicle.label if vp.vehicle.HasField("label") else None,
-                    "RunByVehicleGid": vp.vehicle.id if vp.vehicle.HasField("id") else None,
-                }
+            if not trip_id:
+                continue
+
+            # Track min/max timestamp for InProgress/VehicleAssigned fields
+            ts = int(vp.timestamp) if vp.timestamp else None
+            if ts is not None:
+                if trip_id not in vp_ts_min or ts < vp_ts_min[trip_id]:
+                    vp_ts_min[trip_id] = ts
+                if trip_id not in vp_ts_max or ts > vp_ts_max[trip_id]:
+                    vp_ts_max[trip_id] = ts
+
+            # Last-seen vehicle position wins for lat/lon and vehicle IDs
+            vehicle_label = vp.vehicle.label if vp.vehicle.HasField("label") else None
+            vehicle_gid = vp.vehicle.id if vp.vehicle.HasField("id") else None
+            if vehicle_gid:
+                vehicle_to_trip[vehicle_gid] = trip_id
+            if vehicle_label:
+                vehicle_to_trip[vehicle_label] = trip_id
+
+            vp_lookup[trip_id] = {
+                "Coord_Latitude": vp.position.latitude if vp.HasField("position") else None,
+                "Coord_Longitude": vp.position.longitude if vp.HasField("position") else None,
+                "VehicleNumber": vehicle_label,
+                "RunByVehicleGid": vehicle_gid,
+                "AssignedDriverGid": vehicle_gid,
+            }
 
         # Enrich journeys
         for journey in journeys:
-            trip_id = journey.get("JourneyNumber")
-            if trip_id and trip_id in vp_lookup:
+            # Prefer the GTFS-RT/static trip_id fields for matching.
+            trip_id = journey.get("JourneyGid") or journey.get("ReinforcedDVJId")
+
+            # If JourneyGid is missing (common when TripUpdates omit trip_id),
+            # backfill it using the vehicle id/label from VehiclePositions.
+            if not journey.get("JourneyGid"):
+                vehicle_key = (
+                    journey.get("RunByVehicleGid")
+                    or journey.get("AssignedDriverGid")
+                    or journey.get("VehicleNumber")
+                )
+                if vehicle_key:
+                    inferred = vehicle_to_trip.get(vehicle_key)
+                    if inferred:
+                        journey["JourneyGid"] = inferred
+                        journey["ReinforcedDVJId"] = journey.get("ReinforcedDVJId") or inferred
+                        trip_id = inferred
+
+                        if journey.get("DVJId") is None and self._dvj_mapping:
+                            journey["DVJId"] = self._dvj_mapping.get(inferred)
+
+                        enrich = self._trip_enrichment.get(inferred, {}) if self._trip_enrichment else {}
+                        for k in (
+                            "LineNumber",
+                            "ExtendedLineDesignation",
+                            "JourneyStartTime",
+                            "DestinationName",
+                            "JourneyOriginName",
+                            "JourneyEndStopName",
+                            "BlockNumber",
+                            "JourneyStartDateTime",
+                        ):
+                            if journey.get(k) is None and enrich.get(k) is not None:
+                                journey[k] = enrich.get(k)
+
+            # As a last resort, allow matching on JourneyNumber when it equals trip_id.
+            if not trip_id:
+                trip_id = journey.get("JourneyNumber")
+
+            if not trip_id:
+                continue
+
+            if trip_id in vp_lookup:
                 vp = vp_lookup[trip_id]
                 for key, val in vp.items():
-                    if val is not None and (journey.get(key) is None):
+                    if val is not None and journey.get(key) is None:
                         journey[key] = val
+
+            # Set InProgress and VehicleAssigned from MIN/MAX VP timestamps
+            if trip_id in vp_ts_min:
+                dt_from = datetime.fromtimestamp(
+                    vp_ts_min[trip_id], tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                dt_upto = datetime.fromtimestamp(
+                    vp_ts_max[trip_id], tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                journey["InProgressFromDateTime"] = dt_from
+                journey["InProgressUptoDateTime"] = dt_upto
+                journey["VehicleAssignedFromDateTime"] = dt_from
+                journey["VehicleAssignedUptoDateTime"] = dt_upto
+
+        # Enrich calls (primarily for downstream call-level GPS/APC builders).
+        for call in calls:
+            trip_id = call.get("JourneyGid") or call.get("ReinforcedDVJId")
+
+            if not call.get("JourneyGid"):
+                vehicle_key = (
+                    call.get("RunByVehicleGid")
+                    or call.get("AssignedDriverGid")
+                    or call.get("VehicleNumber")
+                )
+                if vehicle_key:
+                    inferred = vehicle_to_trip.get(vehicle_key)
+                    if inferred:
+                        call["JourneyGid"] = inferred
+                        call["ReinforcedDVJId"] = call.get("ReinforcedDVJId") or inferred
+                        trip_id = inferred
+                        if call.get("DVJId") is None and self._dvj_mapping:
+                            call["DVJId"] = self._dvj_mapping.get(inferred)
+
+            if not trip_id:
+                trip_id = call.get("JourneyNumber")
+
+            if not trip_id:
+                continue
+
 
     def _enrich_from_service_alerts(
         self,
@@ -919,7 +1252,11 @@ class GTFSProcessor:
 
         # Flag cancelled journeys
         for journey in journeys:
-            trip_id = journey.get("JourneyNumber")
+            trip_id = (
+                journey.get("JourneyGid")
+                or journey.get("ReinforcedDVJId")
+                or journey.get("JourneyNumber")
+            )
             if trip_id and trip_id in alerts:
                 for a in alerts[trip_id]:
                     # GTFS-RT Effect.NO_SERVICE = cancelled
@@ -938,4 +1275,3 @@ class GTFSProcessor:
     def _normalize_call(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Ensure all call schema fields are present with correct defaults."""
         return {f.name: raw.get(f.name) for f in CALL_SCHEMA.fields}
-
