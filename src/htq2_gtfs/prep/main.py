@@ -30,7 +30,7 @@ from htq2_gtfs.config import parse_prep_args, PrepConfig, METADATA_TABLE
 from htq2_gtfs.helpers.logging_config import get_logger
 from htq2_gtfs.helpers.file_utils import FILENAME_TS_PATTERN
 from htq2_gtfs.processing.core import GTFSProcessor, JOURNEY_SCHEMA, CALL_SCHEMA, VP_SCHEMA
-from htq2_gtfs.prep.validator import validate_prep_output
+# from htq2_gtfs.prep.validator import validate_prep_output  # DISABLED
 
 logger = get_logger(__name__)
 
@@ -321,14 +321,14 @@ def main() -> None:
             # Step 3: Parse protobuf in main process (not foreachBatch!)
             stats = _parse_raw_files(spark, config, processor, run_id)
 
-            # Step 4: Validate output
-            if stats["journeys"] > 0:
-                fq_j = f"{config.catalog}.{config.bronze_schema}.parsed_journey"
-                fq_c = f"{config.catalog}.{config.bronze_schema}.parsed_call"
-                validate_prep_output(
-                    spark.table(fq_j).filter(F.col("_run_id") == run_id),
-                    spark.table(fq_c).filter(F.col("_run_id") == run_id),
-                )
+            # Step 4: Validation DISABLED — moved to quality_gate task
+            # if stats["journeys"] > 0:
+            #     fq_j = f"{config.catalog}.{config.bronze_schema}.parsed_journey"
+            #     fq_c = f"{config.catalog}.{config.bronze_schema}.parsed_call"
+            #     validate_prep_output(
+            #         spark.table(fq_j).filter(F.col("_run_id") == run_id),
+            #         spark.table(fq_c).filter(F.col("_run_id") == run_id),
+            #     )
 
     except Exception as e:
         logger.error(f"Prep failed: {e}", exc_info=True)
